@@ -4449,34 +4449,39 @@ impl Shadow {
         title.clear();
         title.resize(n, 0);
         let mut written = 0;
-        if crate::host::read_into((start + at) as *const u8, title) {
-            // The stretch as read: what the card did not change is the
-            // title's, and may have been written again since.
-            // As in `copy_back`: the card's byte where it is not what it
-            // was before the submission, else the title's.
-            let was = title.clone();
-            // R6b: most GPU-written pieces have no competing title write.
-            // Use the exact same three-way merge, with a bulk-copy fast path.
-            if merge_card_bytes(title, gpu, old, crate::host::next_resident_rehash() && crate::relay_next::resident_merge()) {
-                written = put_changed(start + at, &was, title);
+        let resident = crate::host::next_resident_rehash();
+        let fast = resident && crate::relay_next::resident_merge();
+        let already_on_gpu = if crate::host::read_into((start + at) as *const u8, title) {
+            if fast && title.as_slice() == old {
+                // The title still holds the baseline. The immutable GPU result
+                // is the exact merge; keep the original title bytes for the
+                // conditional stores performed by put_changed.
+                old.copy_from_slice(gpu);
+                written = put_changed(start + at, title, gpu);
+                true
+            } else {
+                let was = title.clone();
+                if merge_card_bytes(title, gpu, old, false) {
+                    written = put_changed(start + at, &was, title);
+                }
+                false
             }
         } else {
-            // Title memory is not mapped there: the copy keeps what the
-            // card wrote, as before.
             old.copy_from_slice(gpu);
-        }
+            true
+        };
         // Preserve the exact same CPU-visible merge. If its result is
         // already on the card, only the hash needs refreshing before the
         // next submission. A CPU-modified byte still requires upload.
-        if crate::host::next_resident_rehash()
+        if resident
             && self.card.as_ref().is_some_and(|c| c.before.lock().unwrap_or_else(|e| e.into_inner()).is_some())
-            && (crate::relay_next::resident_merge() || old == gpu)
+            && (fast || already_on_gpu || old == gpu)
         {
             // Only CPU bytes which actually differ from the resident GPU
             // result need an upload. Bound the differences by a single span
             // to avoid introducing a large number of tiny copy commands.
             // The entire merged interval still needs its baseline hash refreshed.
-            let upload = resident_upload_span(old, gpu);
+            let upload = if already_on_gpu { None } else { resident_upload_span(old, gpu) };
             self.card_rehash_only(at, at + n);
             let uploaded = if let Some((lo, hi)) = upload {
                 self.card_changed(at + lo, at + hi);
@@ -4490,7 +4495,7 @@ impl Shadow {
             }
         } else {
             self.card_changed(at, at + n);
-            if crate::host::next_resident_rehash() {
+            if resident {
                 crate::relay_next::resident_stats(n as u64, false);
             }
         }
