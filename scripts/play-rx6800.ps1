@@ -24,7 +24,7 @@ $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '0'
     VICTORY_D3D12_DRED = 'light'
     VICTORY_D3D12_DEBUG = '1'
-    VICTORY_LOG = 'warn,victory_gpu::host=info'
+    VICTORY_LOG = 'warn,victory_gpu::host=info,victory_gpu::relay_next=info'
     VICTORY_AMBIENT = '0.8'
     VICTORY_SHOW_AFTER = '1'
     VICTORY_SKIP_PIPELINES = 'none'
@@ -36,7 +36,7 @@ if ($Parallel) {
     $settings.VICTORY_UPLOAD_AHEAD = '1'
     $settings.VICTORY_UPLOAD_WORKERS = '8'
     $settings.VICTORY_INLINE_READBACK = '1'
-    $settings.VICTORY_LOG = 'warn,victory_gpu::host=info,victory_gpu::list::thin=info,victory_gpu::queue::behind=info,victory_gpu::texture::ahead=info'
+    $settings.VICTORY_LOG = 'warn,victory_gpu::host=info,victory_gpu::relay_next=info,victory_gpu::list::thin=info,victory_gpu::queue::behind=info,victory_gpu::texture::ahead=info'
 }
 foreach ($name in $More.Keys) { $settings[$name] = $More[$name] }
 
