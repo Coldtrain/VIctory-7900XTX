@@ -223,6 +223,56 @@ pub(crate) fn not_resident() -> D3D12_HEAP_FLAGS {
     if wait_resident() { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE }
 }
 
+// The explicit paging fence belongs to the residency API, not a GPU
+// command queue. Serialize its signal values and keep the event alive.
+struct ResidencyFence {
+    fence: ID3D12Fence,
+    event: HANDLE,
+    value: u64,
+}
+// SAFETY: the fence is free-threaded and the event is used under the mutex.
+unsafe impl Send for ResidencyFence {}
+
+fn explicit_residency(device: &ID3D12Device) -> Option<ID3D12Device3> {
+    if relay_exact() && std::env::var_os("VICTORY_EXPLICIT_RESIDENCY").is_none_or(|v| v != "0") {
+        device.cast().ok()
+    } else {
+        None
+    }
+}
+
+fn resident_fenced(device: &ID3D12Device3, object: ID3D12Pageable) -> windows::core::Result<()> {
+    static PAGING: Mutex<Option<ResidencyFence>> = Mutex::new(None);
+    let mut paging = PAGING.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: all calls use this device's pageable object; only this thread
+    // uses the event while the paging lock is held.
+    unsafe {
+        device.GetDeviceRemovedReason()?;
+        if paging.is_none() {
+            let fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+            let event = CreateEventW(None, false, false, None)?;
+            *paging = Some(ResidencyFence { fence, event, value: 0 });
+            tracing::info!("Relay 2: explicit D3D12 residency fence enabled");
+        }
+        let p = paging.as_mut().unwrap();
+        p.value += 1;
+        let target = p.value;
+        prep_trace(|| format!("paging fence begin target={target}"));
+        device.EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, &[Some(object.clone())], &p.fence, target)?;
+        if p.fence.GetCompletedValue() < target {
+            p.fence.SetEventOnCompletion(target, p.event)?;
+            WaitForSingleObject(p.event, INFINITE);
+        }
+        device.GetDeviceRemovedReason()?;
+        let completed = p.fence.GetCompletedValue();
+        prep_trace(|| format!("paging fence end target={target} completed={completed}"));
+        if completed < target || completed == u64::MAX {
+            return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80004005u32 as i32)));
+        }
+        Ok(())
+    }
+}
+
 /// A queue of its own that new memory is waited for with ([`mapped`]).
 struct Aside {
     queue: ID3D12CommandQueue,
@@ -244,7 +294,8 @@ unsafe impl Send for Aside {}
 /// path: a tenth of a millisecond to some.
 pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
     static ASIDE: Mutex<Option<Aside>> = Mutex::new(None);
-    if !wait_resident() {
+    // resident() already waited for the actual paging fence in this mode.
+    if !wait_resident() || explicit_residency(device).is_some() {
         return Ok(());
     }
     let started = std::time::Instant::now();
@@ -333,7 +384,11 @@ pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> window
     // SAFETY: a live heap or resource of the device's.
     let key = object.as_raw() as usize;
     prep_trace(|| format!("MakeResident begin object={key:#x}"));
-    let made = unsafe { device.MakeResident(&[Some(object)]) };
+    let made = if let Some(d3) = explicit_residency(device) {
+        resident_fenced(&d3, object)
+    } else {
+        unsafe { device.MakeResident(&[Some(object)]) }
+    };
     prep_trace(|| format!("MakeResident end object={key:#x} elapsed_us={} result={made:?}", started.elapsed().as_micros()));
     let us = started.elapsed().as_micros() as u64;
     RESIDENT[0].fetch_add(1, Ordering::Relaxed);
@@ -3475,6 +3530,13 @@ fn relay_worker() {
                     .collect();
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
+                if completed == u64::MAX {
+                    relay_trace(|| format!("device removed sentinel before landing: target={} queued={}", line.target, fences.len()));
+                    // The removed-device sentinel is not a completed fence.
+                    // Do not drain or retire flights on this value.
+                    drop(line);
+                    fail(format_args!("Relay 2 device removed before landing outstanding flights"));
+                }
                 let n = landable(&fences, completed);
                 relay_trace(|| format!("worker poll completed={completed} target={} queued={} landable={n} device_removed_sentinel={}", line.target, fences.len(), completed == u64::MAX));
                 if n == 0 {
