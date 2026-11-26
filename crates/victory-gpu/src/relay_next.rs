@@ -1,4 +1,4 @@
-//! Relay Next, sprint R2: synchronous submissions with recording ownership.
+//! Relay Next, sprint R3: bounded GPU batches with recording ownership.
 //! Independent of the old relay flight queue. Preparation and title-memory
 //! merging deliberately retain the working synchronous implementation.
 
@@ -10,14 +10,21 @@ use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};
 
-pub(crate) fn enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("VICTORY_RELAY_NEXT").as_deref() {
-        Err(_) | Ok("0") => false,
-        Ok("1") => true,
-        Ok(mode) => panic!("VICTORY_RELAY_NEXT={mode} is not implemented; use 0 or 1"),
+fn mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_RELAY_NEXT").as_deref() {
+        Err(_) | Ok("0") => 0,
+        Ok("1") => 1,
+        Ok("2") => 2,
+        Ok(mode) => panic!("VICTORY_RELAY_NEXT={mode} is not implemented; use 0, 1 or 2"),
     })
 }
+
+pub(crate) fn enabled() -> bool { mode() != 0 }
+
+/// R3 permits at most two tracked GPU batches in a single prepared ticket.
+/// Independent title submissions still complete in order.
+pub(crate) fn paired() -> bool { mode() == 2 }
 
 fn trace() -> bool {
     static TRACE: OnceLock<bool> = OnceLock::new();
@@ -35,21 +42,29 @@ enum Phase {
 #[derive(Debug)]
 struct Progress {
     phase: Phase,
+    pending: usize,
+    peak: usize,
 }
 
 impl Progress {
     fn new() -> Self {
-        Self { phase: Phase::Preparing }
+        Self { phase: Phase::Preparing, pending: 0, peak: 0 }
     }
 
     fn sent(&mut self, fence: u64) -> bool {
-        if fence == 0 || fence == u64::MAX || !match self.phase {
+        self.enqueue(fence, 1)
+    }
+
+    fn enqueue(&mut self, fence: u64, limit: usize) -> bool {
+        if fence == 0 || fence == u64::MAX || self.pending >= limit.min(2) || !match self.phase {
             Phase::Preparing => true,
-            Phase::GpuComplete(last) => fence > last,
-            _ => false,
+            Phase::GpuComplete(last) | Phase::InFlight(last) => fence > last,
+            Phase::CpuVisible => false,
         } {
             return false;
         }
+        self.pending += 1;
+        self.peak = self.peak.max(self.pending);
         self.phase = Phase::InFlight(fence);
         true
     }
@@ -59,12 +74,13 @@ impl Progress {
         if actual == u64::MAX || actual < target {
             return false;
         }
+        self.pending = 0;
         self.phase = Phase::GpuComplete(target);
         true
     }
 
     fn visible(&mut self) -> bool {
-        if !matches!(self.phase, Phase::GpuComplete(_)) {
+        if self.pending != 0 || !matches!(self.phase, Phase::GpuComplete(_)) {
             return false;
         }
         self.phase = Phase::CpuVisible;
@@ -94,7 +110,7 @@ impl RecordingLease {
 }
 
 /// A ticket spans the existing submission lock, including CPU copy-back.
-/// It is not a flight queue: R1 never has two tickets executing concurrently.
+/// R3 can queue two GPU batches, but never overlaps two title tickets.
 pub(crate) struct Ticket {
     number: u64,
     progress: Progress,
@@ -110,8 +126,8 @@ impl Ticket {
     pub(crate) fn new(number: u64) -> Self {
         static START: std::sync::Once = std::sync::Once::new();
         START.call_once(|| tracing::info!(
-            mode = 1, max_flights = 1, copy_queue = false,
-            "Relay Next R2: fence-owned recordings; legacy Relay disabled"
+            mode = mode(), max_batches = if paired() { 2 } else { 1 }, max_title_tickets = 1, copy_queue = false,
+            "Relay Next R3: bounded GPU batches; legacy Relay disabled"
         ));
         Self { number, progress: Progress::new(), groups: 0, start: std::time::Instant::now(),
             leases: Vec::new(), lease_keys: HashSet::new(), pins: Vec::new(), pin_keys: HashSet::new() }
@@ -135,10 +151,11 @@ impl Ticket {
 
     pub(crate) fn send(
         &mut self, device: &ID3D12Device, queue: &ID3D12CommandQueue,
-        fence: &ID3D12Fence, event: HANDLE, target: u64,
-        lists: &[Option<ID3D12CommandList>], queued: impl FnOnce(),
+        fence: &ID3D12Fence, target: u64,
+        lists: &[Option<ID3D12CommandList>], overlap: bool, queued: impl FnOnce(),
     ) {
-        if !self.progress.sent(target) {
+        let accepted = if overlap && paired() { self.progress.enqueue(target, 2) } else { self.progress.sent(target) };
+        if !accepted {
             crate::host::fail(format_args!("Relay Next invalid submission transition: {} {:?}", self.number, self.progress));
         }
         for list in lists.iter().flatten() { self.pin(list); }
@@ -151,17 +168,31 @@ impl Ticket {
             queue.ExecuteCommandLists(lists);
             queued();
             queue.Signal(fence, target)
-                .and_then(|()| fence.SetEventOnCompletion(target, event))
                 .unwrap_or_else(|e| crate::host::fail(format_args!("Relay Next signal failed for {} fence {target}: {e}", self.number)));
         }
         self.groups += 1;
+        if self.progress.pending == 2 {
+            static PAIRS: AtomicU64 = AtomicU64::new(0);
+            let pairs = PAIRS.fetch_add(1, Ordering::Relaxed) + 1;
+            if pairs == 1 || pairs.is_multiple_of(256) || trace() {
+                tracing::info!(submission = self.number, target, pairs, "Relay Next R3: two GPU batches queued without an intermediate CPU wait");
+            }
+        }
         if trace() {
             tracing::info!(submission = self.number, target, lists = lists.len(), "Relay Next submitted");
         }
     }
 
     pub(crate) fn wait(&mut self, device: &ID3D12Device, fence: &ID3D12Fence, event: HANDLE) {
-        // SAFETY: the caller's event was registered by send under the lock.
+        let Phase::InFlight(target) = self.progress.phase else {
+            crate::host::fail(format_args!("Relay Next wait without pending GPU work: submission {}", self.number));
+        };
+        // Arm only the highest fence, once. Registering the same auto-reset
+        // event for both batches could wake on the first fence prematurely.
+        unsafe {
+            fence.SetEventOnCompletion(target, event).unwrap_or_else(|e|
+                crate::host::fail(format_args!("Relay Next fence event registration failed for {target}: {e}")));
+        }
         let status = unsafe { WaitForSingleObject(event, INFINITE) };
         let completed = unsafe { fence.GetCompletedValue() };
         let health = unsafe { device.GetDeviceRemovedReason() };
@@ -186,7 +217,7 @@ impl Ticket {
         }
         if trace() || self.number.is_multiple_of(256) {
             tracing::info!(submission = self.number, groups = self.groups,
-                recordings = self.leases.len(), pinned_objects = self.pins.len(),
+                recordings = self.leases.len(), pinned_objects = self.pins.len(), peak_batches = self.progress.peak,
                 elapsed_us = self.start.elapsed().as_micros() as u64, "Relay Next CPU visible");
         }
         for lease in &self.leases {
@@ -218,6 +249,22 @@ mod tests {
         assert!(!p.sent(7));
         assert!(!p.visible());
     }
+    #[test]
+    fn two_batches_require_last_fence_and_reject_third() {
+        let mut p = Progress::new();
+        assert!(p.enqueue(10, 2));
+        assert!(p.enqueue(11, 2));
+        assert_eq!(p.peak, 2);
+        assert!(!p.enqueue(12, 2));
+        assert!(!p.enqueue(12, usize::MAX));
+        assert!(!p.completed(10));
+        assert!(!p.completed(u64::MAX));
+        assert!(!p.visible());
+        assert!(p.completed(11));
+        assert_eq!(p.pending, 0);
+        assert!(p.visible());
+    }
+
     #[test]
     fn recording_lease_is_exclusive_and_reusable_only_by_owner() {
         let lease = RecordingLease::default();
