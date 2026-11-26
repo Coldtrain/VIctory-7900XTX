@@ -1315,6 +1315,7 @@ const BATCHES: u32 = 8;
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
+    next_lease: std::sync::Arc<crate::relay_next::RecordingLease>,
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
     /// Work for submission time, in recorded order.
@@ -4229,6 +4230,7 @@ impl Host {
                 );
             }
             Ok(HostList {
+                next_lease: Default::default(),
                 allocator,
                 list,
                 deferred: Mutex::default(),
@@ -5202,9 +5204,16 @@ impl Host {
                     self.queue.Signal(&self.fence, *submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
-                    WaitForSingleObject(self.event, INFINITE);
+                    let status = WaitForSingleObject(self.event, INFINITE);
                     stood(waiting);
                     working(was_working);
+                    if crate::relay_next::enabled() {
+                        self.device.GetDeviceRemovedReason()?;
+                        let completed = self.fence.GetCompletedValue();
+                        if status != windows::Win32::Foundation::WAIT_OBJECT_0 || completed == u64::MAX || completed < *submitted {
+                            return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80004005u32 as i32)));
+                        }
+                    }
                     Ok(())
                 })()
             };
@@ -5696,8 +5705,13 @@ impl Host {
         prep_checkpoint(&self.device, "submit: gathering what to ask about");
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         let mut next_ticket = crate::relay_next::enabled().then(|| crate::relay_next::Ticket::new(this_submission));
-        if next_ticket.is_some() && late {
-            fail(format_args!("Relay Next R1 cannot use legacy late submission"));
+        if let Some(ticket) = next_ticket.as_mut() {
+            if late {
+                fail(format_args!("Relay Next R2 cannot use legacy late submission"));
+            }
+            for list in runs {
+                ticket.claim(&list.next_lease);
+            }
         }
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
@@ -5942,6 +5956,20 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        if let Some(ticket) = next_ticket.as_mut() {
+            for list in runs {
+                list.next_pin(ticket);
+            }
+            if let Some(plan) = &card {
+                for (_, (allocator, list)) in &plan.lists {
+                    ticket.pin(allocator);
+                    ticket.pin(list);
+                }
+                for range in &plan.ranges {
+                    ticket.pin(&range.shadow.buffer);
+                }
+            }
+        }
         submitting(2, runs.len());
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
@@ -6456,7 +6484,48 @@ impl HostList {
 
     /// Only after the list's last submission finished (every one is waited
     /// for).
+    pub(crate) fn assert_next_idle(&self) {
+        if crate::relay_next::enabled() {
+            self.next_lease.assert_idle();
+        }
+    }
+
+    /// Explicitly retain the known objects of this prepared recording.
+    /// The recording lease additionally keeps its scratch/upload owners
+    /// from recycling their memory while the ticket is active.
+    fn next_pin(&self, ticket: &mut crate::relay_next::Ticket) {
+        ticket.pin(&self.allocator);
+        ticket.pin(&self.list);
+        if let Some(Some((allocator, list))) = self.prelude.get() {
+            ticket.pin(allocator);
+            ticket.pin(list);
+        }
+        {
+            let d = self.deferred();
+            for object in &d.kept { ticket.pin(object); }
+            for upload in &d.uploads { ticket.pin(upload); }
+            for (buffer, _, _) in &d.backs { ticket.pin(buffer); }
+        }
+        {
+            let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+            for (_, _, texture) in states.values() { ticket.pin(&texture.texture); }
+        }
+        {
+            let scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+            for (chunk, _) in &scratch.chunks { ticket.pin(&chunk.buffer); }
+        }
+        if let Some(Some((buffer, _))) = self.budget.get() { ticket.pin(buffer); }
+        if let Some(Some(buffer)) = self.card_budget.get() { ticket.pin(buffer); }
+        if let Some((buffer, _)) = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            ticket.pin(buffer);
+        }
+        for buffer in &self.batch_args.lock().unwrap_or_else(|e| e.into_inner()).0 {
+            ticket.pin(buffer);
+        }
+    }
+
     pub(crate) fn reset(&self) {
+        self.assert_next_idle();
         prep_trace(|| format!("list reset begin list={:#x} allocator={:#x}", self.list.as_raw() as usize, self.allocator.as_raw() as usize));
         self.changed_something();
         #[cfg(feature = "diagnostics")]
