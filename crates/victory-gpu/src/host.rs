@@ -2118,7 +2118,17 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
 
 /// What the host keeps for copies in the card's own memory
 /// ([`crate::shadow::cards`]): three lists of ours and the compare.
+/// Private comparison results and fetch storage, leased to exactly one
+/// Relay Next card plan. R4 still finishes all GPU copies and CPU merges
+/// before another title submission may prepare.
+struct NextSnapshot {
+    differs: (ID3D12Resource, usize, u64),
+    fetch: Prelude,
+    fetched: Mutex<Option<(ID3D12Resource, usize, u64)>>,
+}
+
 struct CardWork {
+    next_free: Vec<NextSnapshot>,
     /// Before a submission's lists: what changed on the copies' CPU side
     /// goes to their card side. Those not in use: a plan takes one and
     /// gives it back when its submission has run (`Host::card_done`), so
@@ -2335,6 +2345,7 @@ impl CardPlan {
 
 /// What a submission does for copies in the card's memory.
 struct CardPlan {
+    next_snapshot: Option<NextSnapshot>,
     ranges: Vec<CardRange>,
     /// The compare, run after the submission's lists.
     check: Option<ID3D12CommandList>,
@@ -4359,6 +4370,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             name(&pso, || crate::replay::play::COMPARE.into());
             Ok(CardWork {
+                next_free: Vec::new(),
                 sync: vec![list()?],
                 check: vec![list()?],
                 fetch: list()?,
@@ -4413,6 +4425,20 @@ impl Host {
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let work = work.as_mut()?;
+        let next_snapshot = if crate::relay_next::snapshots() {
+            Some(work.next_free.pop().unwrap_or_else(|| {
+                let bytes = work.differs.2;
+                let (buffer, data) = self.shared_buffer(bytes).unwrap_or_else(||
+                    fail(format_args!("Relay Next: cannot allocate private comparison results")));
+                let fetch = self.make_prelude().unwrap_or_else(||
+                    fail(format_args!("Relay Next: cannot allocate private fetch command list")));
+                name(&buffer, || "Relay Next private comparison results".into());
+                tracing::info!(bytes, "Relay Next R4: private snapshot storage allocated");
+                NextSnapshot { differs: (buffer, data as usize, bytes), fetch, fetched: Mutex::new(None) }
+            }))
+        } else { None };
+        let differs = next_snapshot.as_ref().map_or(&work.differs, |s| &s.differs);
+        let result_bytes = differs.2;
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
@@ -4484,7 +4510,7 @@ impl Host {
                     }
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
-                    list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    list.SetComputeRootUnorderedAccessView(3, differs.0.GetGPUVirtualAddress());
                     for (shadow, ranges) in &dirty {
                         let (Some((_, Some(before), _)), size) = (shadow.card_sides(), shadow.card_hash_size()) else {
                             continue;
@@ -4532,6 +4558,7 @@ impl Host {
         }
         drop(order);
         let mut plan = CardPlan {
+            next_snapshot,
             ranges: Vec::new(),
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
@@ -4542,7 +4569,7 @@ impl Host {
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
-        let mut at = work.taken;
+        let mut at = if plan.next_snapshot.is_some() { 0 } else { work.taken };
         for (shadow, ranges) in &declared {
             let mut sorted = ranges.clone();
             sorted.sort_unstable();
@@ -4558,7 +4585,7 @@ impl Host {
                 let Some(span) = shadow.card_span(from, to) else {
                     continue;
                 };
-                let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
+                let compared = twin && u64::from(at).saturating_add(u64::from(span.pieces)) * 4 <= result_bytes;
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
                     declared: (from, to),
@@ -4576,7 +4603,7 @@ impl Host {
             let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
             if let Some(span) = shadow.card_span(*from, from + len)
                 && twin
-                && u64::from(at + span.pieces) * 4 <= work.differs.2
+                && u64::from(at).saturating_add(u64::from(span.pieces)) * 4 <= result_bytes
             {
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
@@ -4589,7 +4616,9 @@ impl Host {
                 at += span.pieces;
             }
         }
-        work.taken = at;
+        if plan.next_snapshot.is_none() {
+            work.taken = at;
+        }
         if plan.ranges.iter().any(|r| r.compared) {
             let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
@@ -4614,7 +4643,8 @@ impl Host {
                     }]);
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
-                    list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    let results = plan.next_snapshot.as_ref().map_or(&work.differs, |s| &s.differs);
+                    list.SetComputeRootUnorderedAccessView(3, results.0.GetGPUVirtualAddress());
                     for r in plan.ranges.iter().filter(|r| r.compared) {
                         let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
                             continue;
@@ -4666,6 +4696,13 @@ impl Host {
         let Some(work) = work.as_mut() else {
             return;
         };
+        if let Some(snapshot) = plan.next_snapshot {
+            // The fetch fence was verified and the CPU merge returned.
+            // Keep at most two idle snapshots; no live plan shares them.
+            if work.next_free.len() < 2 {
+                work.next_free.push(snapshot);
+            }
+        }
         for (check, list) in plan.lists {
             if check { work.check.push(list) } else { work.sync.push(list) }
         }
@@ -5158,7 +5195,8 @@ impl Host {
         };
         // SAFETY: the mapping of the results, which the compare (it has
         // run) wrote.
-        let differs = unsafe { std::slice::from_raw_parts(work.differs.1 as *const u32, (work.differs.2 / 4) as usize) };
+        let results = plan.next_snapshot.as_ref().map_or(&work.differs, |s| &s.differs);
+        let differs = unsafe { std::slice::from_raw_parts(results.1 as *const u32, (results.2 / 4) as usize) };
         // The pieces to fetch: the range, the offsets in its copy, and
         // where the bytes come down.
         let mut pieces: Vec<(usize, usize, usize, u64)> = Vec::new();
@@ -5179,15 +5217,25 @@ impl Host {
         }
         let mut written = vec![0usize; plan.ranges.len()];
         if !pieces.is_empty() {
-            if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
+            let mut leased_fetch;
+            let (fetch_buffer, fetch_list) = if let Some(snapshot) = &plan.next_snapshot {
+                leased_fetch = snapshot.fetched.lock().unwrap_or_else(|e| e.into_inner());
+                (&mut *leased_fetch, &snapshot.fetch)
+            } else {
+                (&mut work.fetched, &work.fetch)
+            };
+            if fetch_buffer.as_ref().is_none_or(|f| f.2 < total) {
                 let size = total.next_multiple_of(16 << 20);
-                work.fetched = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+                *fetch_buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+                if plan.next_snapshot.is_some() {
+                    tracing::info!(size, "Relay Next R4: private fetch storage resized");
+                }
             }
-            let Some((fetched, data, _)) = &work.fetched else {
+            let Some((fetched, data, _)) = fetch_buffer.as_ref() else {
                 fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes)"));
             };
             let waiting = std::time::Instant::now();
-            let (allocator, list) = &work.fetch;
+            let (allocator, list) = fetch_list;
             // SAFETY: the list's last run was waited for; live buffers; the
             // fence and event are ours, under the submission lock.
             let ran = unsafe {
