@@ -38,6 +38,8 @@ mod book;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
+mod relay_next;
+#[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
 mod inplace;
