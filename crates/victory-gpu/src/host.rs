@@ -5786,6 +5786,91 @@ impl Host {
     /// `submitted` is the last value signalled on the fence. `seen` holds
     /// the pieces fetched already since the card was last waited for
     /// (several submissions settled together name the same ones).
+    /// Parallel CPU landing of private, already completed packed bytes.
+    /// Holding a mapping read guard makes the backing identity checks
+    /// stable until all jobs finish. Unclassified mappings fall back
+    /// to the old serial merge, not an assumption of independence.
+    fn next_packed_landing(
+        &self, plan: &CardPlan, pieces: &[(usize, usize, usize, u64)],
+        offsets: &[usize], data: usize, written: &mut [usize],
+    ) -> usize {
+        use crate::inplace::Cover;
+        use std::sync::Arc;
+        if !crate::relay_next::parallel_packed() || pieces.len() < 16
+            || pieces.iter().map(|&(_, lo, hi, _)| hi - lo).sum::<usize>() < 256 * 1024 {
+            return 0;
+        }
+        let workers = crate::relay_next::packed_workers().len();
+        if workers < 2 { return 0; }
+        let Some(_mapping) = crate::watch::title_memory_reading_now() else { return 0; };
+        // Serialize pieces sharing a virtual or actual backing 64 KiB
+        // block. This is intentionally stricter than byte disjointness.
+        // Different shadows of the same section page share a component.
+        const BLOCK: u64 = 64 * 1024;
+        let mut keys = Vec::with_capacity(pieces.len());
+        for &(i, lo, hi, _) in pieces {
+            let shadow = &plan.ranges[i].shadow;
+            if shadow.in_place() || lo >= hi { return 0; }
+            let Some(start) = (shadow.span().0 as usize).checked_add(lo) else { return 0; };
+            let Some(end) = start.checked_add(hi - lo) else { return 0; };
+            let mut piece = Vec::new();
+            for page in (start as u64 / BLOCK)..=((end as u64 - 1) / BLOCK) {
+                piece.push((0u8, 0usize, page));
+            }
+            match crate::inplace::cover(start, hi - lo) {
+                Cover::Run(section, offset) => {
+                    let Some(last) = offset.checked_add((hi - lo - 1) as u64) else { return 0; };
+                    for page in (offset / BLOCK)..=(last / BLOCK) {
+                        piece.push((1, section, page));
+                    }
+                }
+                Cover::None if crate::inplace::private_whole(start, hi - lo) => {}
+                _ => return 0,
+            }
+            keys.push(piece);
+        }
+        let mut groups = crate::relay_next::packed_components(&keys);
+        if groups.len() < 2 { return 0; }
+        // Balance whole components by bytes; original ordering within
+        // each component is never changed.
+        let weight = |g: &[usize]| g.iter().map(|&p| pieces[p].2 - pieces[p].1).sum::<usize>();
+        groups.sort_unstable_by_key(|g| std::cmp::Reverse(weight(g)));
+        let n = workers.min(groups.len());
+        let mut buckets: Vec<Vec<usize>> = (0..n).map(|_| Vec::new()).collect();
+        let mut loads = vec![0usize; n];
+        for group in groups {
+            let at = (0..n).min_by_key(|&i| loads[i]).unwrap();
+            loads[at] += weight(&group);
+            buckets[at].extend(group);
+        }
+        let counts: Arc<Vec<std::sync::atomic::AtomicUsize>> =
+            Arc::new((0..written.len()).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect());
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets.into_iter().map(|bucket| {
+            let work: Vec<_> = bucket.into_iter().map(|p| {
+                let (i, lo, hi, _) = pieces[p];
+                (plan.ranges[i].shadow.clone(), i, lo, hi, offsets[p])
+            }).collect();
+            let counts = counts.clone();
+            Box::new(move || {
+                let mut title = Vec::new();
+                for (shadow, i, lo, hi, offset) in work {
+                    // SAFETY: the GPU has completed; the caller retains
+                    // the private result arena and waits for every job.
+                    // Backing blocks are disjoint between jobs.
+                    let gpu = unsafe { std::slice::from_raw_parts((data + offset) as *const u8, hi - lo) };
+                    let merged = shadow.card_merge(lo, gpu, &mut title);
+                    shadow.walls_merged(gpu.len(), merged);
+                    counts[i].fetch_add(merged, Ordering::Relaxed);
+                }
+            }) as Box<dyn FnOnce() + Send>
+        }).collect();
+        crate::relay_next::run_packed_jobs(jobs);
+        for (out, count) in written.iter_mut().zip(counts.iter()) {
+            *out += count.load(Ordering::Relaxed);
+        }
+        n
+    }
+
     fn card_back(
         &self,
         plan: &CardPlan,
@@ -5840,16 +5925,25 @@ impl Host {
         }
         let mut written = vec![0usize; plan.ranges.len()];
         if !pieces.is_empty() && packed_complete {
-            // No second GPU command list or fence wait. Merge in precisely
-            // the original order, after the render/compare fence completed.
-            let mut title = Vec::new();
-            for (&(i, lo, hi, _), &offset) in pieces.iter().zip(&packed_offsets) {
-                // SAFETY: bounded slot and range checked above; private
-                // arena is retained until this entire CPU merge finishes.
-                let gpu = unsafe { std::slice::from_raw_parts((results.1 + offset) as *const u8, hi - lo) };
-                let merged = plan.ranges[i].shadow.card_merge(lo, gpu, &mut title);
-                plan.ranges[i].shadow.walls_merged(gpu.len(), merged);
-                written[i] += merged;
+            // No second GPU command list or fence wait. The optional
+            // dedicated workers merge only independent backing regions;
+            // otherwise keep the original serial order.
+            let merging = std::time::Instant::now();
+            let workers = self.next_packed_landing(plan, &pieces, &packed_offsets, results.1, &mut written);
+            if workers == 0 {
+                let mut title = Vec::new();
+                for (&(i, lo, hi, _), &offset) in pieces.iter().zip(&packed_offsets) {
+                    // SAFETY: bounded slot and range checked above; private
+                    // arena is retained until this entire CPU merge finishes.
+                    let gpu = unsafe { std::slice::from_raw_parts((results.1 + offset) as *const u8, hi - lo) };
+                    let merged = plan.ranges[i].shadow.card_merge(lo, gpu, &mut title);
+                    plan.ranges[i].shadow.walls_merged(gpu.len(), merged);
+                    written[i] += merged;
+                }
+            }
+            if crate::relay_next::parallel_packed() {
+                crate::relay_next::packed_landing_stats(pieces.len(), total, workers.max(1),
+                    merging.elapsed().as_micros() as u64);
             }
             crate::shadow::CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
             crate::shadow::CARD_STATS[4].fetch_add(total, Ordering::Relaxed);

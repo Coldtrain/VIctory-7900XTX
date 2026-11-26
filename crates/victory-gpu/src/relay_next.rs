@@ -407,6 +407,100 @@ pub(crate) fn merge_workers() -> usize {
         .and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).clamp(1, 8))
 }
 
+/// R12g: the packed path (rather than only the fallback fetch path)
+/// can land on a dedicated set of CPU workers.
+pub(crate) fn parallel_packed() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| packed_readback() && std::env::var_os("VICTORY_RELAY_NEXT_PARALLEL_PACKED").is_some_and(|v| v == "1"))
+}
+
+type PackedJob = Box<dyn FnOnce() + Send>;
+type PackedSender = std::sync::mpsc::SyncSender<PackedJob>;
+
+/// Do not use the shared refresh worker queue while a mapping read
+/// guard is held: unrelated refresh jobs might themselves need that lock.
+pub(crate) fn packed_workers() -> &'static [PackedSender] {
+    static POOL: OnceLock<Vec<PackedSender>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let mut pool = Vec::new();
+        for i in 0..merge_workers() {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<PackedJob>(1);
+            if std::thread::Builder::new().name(format!("victory-packed-{i}")).spawn(move || {
+                crate::cores::keep_helper_on_fast_cores("victory-packed");
+                while let Ok(job) = rx.recv() { job(); }
+            }).is_ok() {
+                pool.push(tx);
+            }
+        }
+        pool
+    })
+}
+
+/// A batch is fully joined before its mappings or result storage can
+/// be released. A panicked job is reported after the other jobs finish.
+pub(crate) fn run_packed_jobs(jobs: Vec<PackedJob>) {
+    let count = jobs.len();
+    let pool = packed_workers();
+    assert!(count <= pool.len());
+    let (done, rx) = std::sync::mpsc::channel();
+    for (job, worker) in jobs.into_iter().zip(pool) {
+        let done = done.clone();
+        let job: PackedJob = Box::new(move || {
+            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_ok();
+            let _ = done.send(ok);
+        });
+        if let Err(e) = worker.send(job) { (e.0)(); }
+    }
+    drop(done);
+    let mut ok = true;
+    for _ in 0..count { ok &= rx.recv().unwrap_or(false); }
+    if !ok { crate::host::fail(format_args!("Relay Next packed landing worker failed")); }
+}
+
+/// Union components of overlapping virtual/backing blocks, retaining
+/// original piece order within each component.
+pub(crate) fn packed_components(keys: &[Vec<(u8, usize, u64)>]) -> Vec<Vec<usize>> {
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            let next = parent[i];
+            parent[i] = parent[next];
+            i = parent[i];
+        }
+        i
+    }
+    let mut parent: Vec<usize> = (0..keys.len()).collect();
+    let mut seen = std::collections::HashMap::new();
+    for (i, piece) in keys.iter().enumerate() {
+        for &key in piece {
+            if let Some(other) = seen.insert(key, i) {
+                let a = root(&mut parent, i);
+                let b = root(&mut parent, other);
+                if a != b { parent[a] = b; }
+            }
+        }
+    }
+    let mut groups = std::collections::BTreeMap::<usize, Vec<usize>>::new();
+    for i in 0..keys.len() {
+        groups.entry(root(&mut parent, i)).or_default().push(i);
+    }
+    groups.into_values().collect()
+}
+
+pub(crate) fn packed_landing_stats(pieces: usize, bytes: u64, workers: usize, elapsed_us: u64) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static PARALLEL: AtomicU64 = AtomicU64::new(0);
+    static BYTES: AtomicU64 = AtomicU64::new(0);
+    static US: AtomicU64 = AtomicU64::new(0);
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    let parallel_calls = PARALLEL.fetch_add(u64::from(workers > 1), Ordering::Relaxed) + u64::from(workers > 1);
+    let parallel_bytes = BYTES.fetch_add(if workers > 1 { bytes } else { 0 }, Ordering::Relaxed) + if workers > 1 { bytes } else { 0 };
+    let total_us = US.fetch_add(elapsed_us, Ordering::Relaxed) + elapsed_us;
+    if calls == 1 || calls.is_multiple_of(256) || (parallel_calls == 1 && workers > 1) || trace() {
+        tracing::info!(calls, parallel_calls, pieces, bytes, workers, elapsed_us, parallel_bytes, total_us,
+            "Relay Next R12g packed landing worker statistics");
+    }
+}
+
 /// Conservative page-granularity check. Different jobs must never write
 /// the same title page, even through distinct shadow copies.
 pub(crate) fn disjoint_pages(mut ranges: Vec<(usize, usize)>) -> bool {
@@ -690,6 +784,19 @@ impl Ticket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn packed_components_preserve_transitive_alias_order() {
+        let keys = vec![
+            vec![(0, 0, 1), (1, 5, 10)],
+            vec![(0, 0, 2), (1, 5, 11)],
+            vec![(0, 0, 3), (1, 5, 10), (1, 5, 11)],
+            vec![(0, 0, 4), (1, 6, 10)],
+        ];
+        let mut got = packed_components(&keys);
+        got.sort();
+        assert_eq!(got, vec![vec![0, 1, 2], vec![3]]);
+    }
+
     #[test]
     fn rejects_overlapping_and_premature_completion() {
         let mut p = Progress::new();
