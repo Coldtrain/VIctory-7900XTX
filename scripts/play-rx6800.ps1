@@ -12,7 +12,8 @@ if (-not (Test-Path -LiteralPath $victory -PathType Leaf)) {
 $game = (Resolve-Path -LiteralPath $Exe -ErrorAction Stop).Path
 
 $settings = @{
-    VICTORY_RELAY = '0'
+    VICTORY_RELAY = '2'
+    VICTORY_RELAY_COPY = '0'
     VICTORY_ASYNC_SUBMIT = '1'
     VICTORY_THIN = '0'
     VICTORY_UPLOAD_AHEAD = '1'
