@@ -1316,6 +1316,87 @@ mod tests {
 /// The batches of clamped records in one scratch buffer
 /// ([`HostList::batch_place`]).
 const BATCHES: u32 = 8;
+const POOLED_BATCHES: u32 = 32;
+
+/// Belobug e9428969: share indirect-batch buffers between completed lists.
+/// Keep this experiment on the synchronous Relay 0 path.
+fn amd_batch_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let requested = std::env::var_os("VICTORY_PORT_AMD_BATCH_POOL").is_some_and(|v| v == "1");
+        let enabled = requested && !late() && !crate::relay_next::enabled();
+        if requested {
+            tracing::info!(enabled, batches = if enabled { POOLED_BATCHES } else { BATCHES },
+                "Belobug indirect batch buffer pool (VICTORY_PORT_AMD_BATCH_POOL)");
+        }
+        enabled
+    })
+}
+
+fn batches_per_buffer() -> u32 {
+    if amd_batch_pool() { POOLED_BATCHES } else { BATCHES }
+}
+
+/// A buffer returned after its list is no longer executing. Closed lists
+/// transition their used batch buffers back to COMMON.
+struct BatchBuf(ID3D12Resource);
+// SAFETY: D3D12 resources are free-threaded; ownership of pooled buffers
+// transfers only through the mutex, after the previous recording is idle.
+unsafe impl Send for BatchBuf {}
+static SPARE_BATCH: Mutex<Vec<BatchBuf>> = Mutex::new(Vec::new());
+static BATCH_POOL_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+fn take_batch_buffer(size: u64) -> Option<ID3D12Resource> {
+    if amd_batch_pool() {
+        let spare = SPARE_BATCH.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        if let Some(BatchBuf(buf)) = spare {
+            // SAFETY: the pooled resource is live. Never use a smaller buffer.
+            if unsafe { buf.GetDesc() }.Width >= size {
+                BATCH_POOL_STATS[0].fetch_add(1, Ordering::Relaxed);
+                return Some(buf);
+            }
+            BATCH_POOL_STATS[3].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let made = host()?.uav_buffer(size)?;
+    name(&made, || format!("indirect batches {size:#x}"));
+    if amd_batch_pool() {
+        BATCH_POOL_STATS[1].fetch_add(1, Ordering::Relaxed);
+    }
+    Some(made)
+}
+
+fn give_batch_buffers(buffers: Vec<ID3D12Resource>) {
+    if buffers.is_empty() { return; }
+    let limit = if keep_freed() && crate::resource::room_lately() { 64 } else { 16 };
+    let mut overflow = Vec::new();
+    {
+        let mut spare = SPARE_BATCH.lock().unwrap_or_else(|e| e.into_inner());
+        while spare.len() > limit {
+            if let Some(BatchBuf(buf)) = spare.pop() { overflow.push(buf); }
+        }
+        for buf in buffers {
+            if spare.len() < limit {
+                spare.push(BatchBuf(buf));
+                BATCH_POOL_STATS[2].fetch_add(1, Ordering::Relaxed);
+            } else {
+                overflow.push(buf);
+            }
+        }
+    }
+    BATCH_POOL_STATS[3].fetch_add(overflow.len() as u64, Ordering::Relaxed);
+    drop(overflow);
+}
+
+fn batch_pool_line(frames: f64) {
+    if !amd_batch_pool() { return; }
+    let [reused, made, returned, discarded] = BATCH_POOL_STATS.each_ref()
+        .map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames.max(1e-9));
+    let idle = SPARE_BATCH.lock().unwrap_or_else(|e| e.into_inner()).len();
+    tracing::info!(
+        "Belobug indirect batch pool per frame: {reused:.1} reused, {made:.1} allocated, {returned:.1} returned, {discarded:.1} discarded; {idle} idle buffers"
+    );
+}
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
@@ -8023,6 +8104,18 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
+        if amd_batch_pool() {
+            let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
+            let left = std::mem::take(&mut args.1);
+            let buffers = std::mem::take(&mut args.0);
+            drop(args);
+            // clear_for_reset requires exclusive ownership and an idle GPU
+            // recording. A nonzero count means it never recorded its closing
+            // barriers; discard rather than put those buffers in the pool.
+            if left == 0 {
+                give_batch_buffers(buffers);
+            }
+        }
     }
 
     /// R13a: only the D3D12 allocator/list reset may be dispatched to a
@@ -8932,11 +9025,11 @@ impl HostList {
     pub(crate) fn batch_place(&self) -> Option<(ID3D12Resource, u32, D3D12_RESOURCE_STATES)> {
         use crate::indirect::batch::{JOBS, SLOT};
         let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
-        let (buffer, i) = ((args.1 / BATCHES) as usize, args.1 % BATCHES);
+        let batches = batches_per_buffer();
+        let (buffer, i) = ((args.1 / batches) as usize, args.1 % batches);
         if buffer == args.0.len() {
-            let size = u64::from(BATCHES * JOBS * SLOT);
-            let made = host()?.uav_buffer(size)?;
-            name(&made, || format!("indirect batches {size:#x}"));
+            let size = u64::from(batches * JOBS * SLOT);
+            let made = take_batch_buffer(size)?;
             args.0.push(made);
         }
         args.1 += 1;
@@ -8950,7 +9043,7 @@ impl HostList {
     /// back to the common state, where the next recording expects them.
     fn batches_common(&self) {
         let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
-        let used = std::mem::take(&mut args.1).div_ceil(BATCHES) as usize;
+        let used = std::mem::take(&mut args.1).div_ceil(batches_per_buffer()) as usize;
         let barriers: Vec<D3D12_RESOURCE_BARRIER> = args.0[..used]
             .iter()
             .map(|b| transition(b, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON))
@@ -10739,6 +10832,7 @@ impl Meter {
         );
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
+        batch_pool_line(frames);
         late_line(frames);
         crate::queue::behind_line(frames);
         card_clock_line(frames, ms);
