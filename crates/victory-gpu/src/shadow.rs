@@ -920,7 +920,7 @@ pub(crate) fn relay() -> bool {
     // The crate's own tests run without it unless they ask: several of
     // them look at title memory right after a submission, which the
     // relay's landing thread may still be writing.
-    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2") && !keeps())
+    *ON.get_or_init(|| !crate::relay_next::enabled() && std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2") && !keeps())
 }
 
 /// The submission being prepared (its number among those started): what
