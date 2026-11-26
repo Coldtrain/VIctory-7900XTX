@@ -3362,12 +3362,121 @@ pub(crate) fn joins() -> (usize, usize) {
 /// cross a wait, signal or present (enforced by the queue lane).
 pub(crate) fn next_joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&'a HostList]) -> bool {
     if crate::picked::on() || upcheck::on() || next.is_empty() { return false; }
-    ahead.chain(next.iter().copied()).all(|list| {
+    if !crate::relay_next::dependency_batches() {
+        return ahead.chain(next.iter().copied()).all(|list| {
+            let d = list.deferred();
+            d.copies.is_empty() && d.writes.is_empty() && d.backs.is_empty()
+                && d.back_wanted.is_empty() && d.texture_backs.is_empty()
+                && d.gpu_written.is_empty()
+        });
+    }
+    let ahead: Vec<_> = ahead.collect();
+    let answer = (|| {
+        let a = next_join_access(&ahead, true)?;
+        let b = next_join_access(next, false)?;
+        // Full shadow spans cover aliasing and refreshes widened by the
+        // write watcher. Keep write/read and write/write conflicts separate.
+        if next_join_overlap(&a.writes, &b.reads)
+            || next_join_overlap(&a.writes, &b.writes)
+            || next_join_overlap(&b.writes, &a.reads)
+            || next_join_overlap(&a.fills, &b.fills)
+        { return Err(3); }
+        Ok(())
+    })();
+    crate::relay_next::join_decision(answer.as_ref().err().copied());
+    answer.is_ok()
+}
+
+/// A conservative CPU-visible memory footprint, not a GPU resource-state
+/// tracker. GPU commands still execute on the same ordered direct queue.
+#[derive(Default)]
+struct NextJoinAccess {
+    reads: Vec<(usize, usize)>,
+    writes: Vec<(usize, usize)>,
+    fills: Vec<(usize, usize)>,
+}
+
+fn next_join_overlap(a: &[(usize, usize)], b: &[(usize, usize)]) -> bool {
+    // Both operands have been sorted and coalesced.
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i].1 <= b[j].0 { i += 1; }
+        else if b[j].1 <= a[i].0 { j += 1; }
+        else { return true; }
+    }
+    false
+}
+
+fn next_join_pages(ranges: &mut Vec<(usize, usize)>, from: usize, len: usize) -> Result<(), usize> {
+    if len == 0 { return Ok(()); }
+    let to = from.checked_add(len).and_then(|n| n.checked_add(4095)).ok_or(2usize)?;
+    ranges.push((from & !4095, to & !4095));
+    Ok(())
+}
+
+fn next_join_access(runs: &[&HostList], earlier: bool) -> Result<NextJoinAccess, usize> {
+    let mut access = NextJoinAccess::default();
+    for list in runs {
         let d = list.deferred();
-        d.copies.is_empty() && d.writes.is_empty() && d.backs.is_empty()
-            && d.back_wanted.is_empty() && d.texture_backs.is_empty()
-            && d.gpu_written.is_empty()
-    })
+        // A joined group's final list may notify the CPU after landing.
+        // No earlier part may have a CPU-visible notification or readback.
+        // Texture readbacks are deliberately excluded even in the last part
+        // because their alias footprint is not represented here.
+        if (earlier && (!d.writes.is_empty() || !d.backs.is_empty()))
+            || !d.back_wanted.is_empty() || !d.texture_backs.is_empty()
+        { return Err(0); }
+        for step in &d.copies {
+            match step {
+                Step::Refresh(shadow, ..) | Step::GpuWrite(shadow, ..) => {
+                    let (from, len) = shadow.span();
+                    let range = if matches!(step, Step::GpuWrite(..)) {
+                        &mut access.writes
+                    } else { &mut access.reads };
+                    next_join_pages(range, from as usize, len as usize)?;
+                }
+                Step::Fill(dst, src, len, _) => {
+                    next_join_pages(&mut access.reads, *src, *len)?;
+                    // Exact destination byte intervals: independent private
+                    // upload fills may legitimately share an allocator page.
+                    if *len > 0 {
+                        access.fills.push((*dst, dst.checked_add(*len).ok_or(2usize)?));
+                    }
+                }
+                Step::Texture(staging) => {
+                    let (at, len) = staging.memory();
+                    next_join_pages(&mut access.reads, at, len)?;
+                }
+                // Unknown host destinations and title copies are not moved
+                // before an earlier submission. Keep the original path.
+                Step::Copy(..) | Step::Run(_) | Step::Host(..) | Step::Placed(_) => return Err(1),
+            }
+        }
+    }
+    for ranges in [&mut access.reads, &mut access.writes, &mut access.fills] {
+        join_ranges(ranges, std::iter::empty());
+    }
+    Ok(access)
+}
+
+#[cfg(test)]
+mod next_dependency_tests {
+    use super::*;
+    #[test]
+    fn disjoint_or_touching_intervals_do_not_conflict() {
+        assert!(!next_join_overlap(&[(0, 10), (20, 30)], &[(10, 20), (30, 40)]));
+        assert!(next_join_overlap(&[(0, 10), (20, 30)], &[(9, 21)]));
+        assert!(next_join_overlap(&[(10, 20)], &[(0, 100)]));
+        assert!(!next_join_overlap(&[], &[(0, 100)]));
+    }
+    #[test]
+    fn page_aliases_are_conservative_and_overflow_is_rejected() {
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        next_join_pages(&mut a, 4097, 1).unwrap();
+        next_join_pages(&mut b, 8191, 1).unwrap();
+        assert!(next_join_overlap(&a, &b));
+        assert!(next_join_pages(&mut a, usize::MAX, 1).is_err());
+    }
 }
 
 fn joins_asked() -> (usize, usize) {

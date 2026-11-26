@@ -42,12 +42,37 @@ pub(crate) fn scheduler_depth() -> usize {
         .and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).clamp(1, 8))
 }
 
-/// Number of strictly side-effect-free title submissions that may be
-/// combined, preserving their ExecuteCommandLists boundaries.
+/// R9b broadens admission without lifting the dependency checks.
+pub(crate) fn dependency_batches() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| scheduler() && std::env::var_os("VICTORY_RELAY_NEXT_DEPENDENCY_BATCHES").is_some_and(|v| v == "1"))
+}
+
+/// A final compare batch may follow the title parts: seven parts means
+/// at most eight GPU batches, all with their original queue boundaries.
 pub(crate) fn scheduler_parts() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| std::env::var("VICTORY_RELAY_NEXT_JOIN_PARTS").ok()
-        .and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).clamp(1, 4))
+        .and_then(|v| v.parse::<usize>().ok()).unwrap_or(4)
+        .clamp(1, if dependency_batches() { 7 } else { 4 }))
+}
+
+pub(crate) fn join_decision(rejection: Option<usize>) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static ACCEPTED: AtomicU64 = AtomicU64::new(0);
+    static REJECTED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if let Some(reason) = rejection {
+        REJECTED[reason.min(3)].fetch_add(1, Ordering::Relaxed);
+    } else { ACCEPTED.fetch_add(1, Ordering::Relaxed); }
+    if calls == 1 || calls.is_multiple_of(256) || trace() {
+        tracing::info!(calls, accepted = ACCEPTED.load(Ordering::Relaxed),
+            visibility = REJECTED[0].load(Ordering::Relaxed),
+            opaque = REJECTED[1].load(Ordering::Relaxed),
+            overflow = REJECTED[2].load(Ordering::Relaxed),
+            alias = REJECTED[3].load(Ordering::Relaxed),
+            "Relay Next R9b dependency admission statistics");
+    }
 }
 
 pub(crate) fn scheduler_stats(parts: usize, lists: usize, elapsed_us: u64) {
@@ -247,7 +272,7 @@ impl Progress {
     }
 
     fn enqueue_bounded(&mut self, fence: u64, limit: usize) -> bool {
-        if fence == 0 || fence == u64::MAX || self.pending >= limit.min(5) || !match self.phase {
+        if fence == 0 || fence == u64::MAX || self.pending >= limit.min(8) || !match self.phase {
             Phase::Preparing => true,
             Phase::GpuComplete(last) | Phase::InFlight(last) => fence > last,
             Phase::CpuVisible => false,
@@ -318,7 +343,7 @@ impl Ticket {
         static START: std::sync::Once = std::sync::Once::new();
         START.call_once(|| tracing::info!(
             mode = mode(), max_batches = if scheduler() { scheduler_parts().max(2) + usize::from(scheduler_parts() >= 2) } else if paired() { 2 } else { 1 }, max_title_tickets = 1, copy_queue = false,
-            independent_scheduler = scheduler(), queue_depth = scheduler_depth(),
+            independent_scheduler = scheduler(), queue_depth = scheduler_depth(), dependency_batches = dependency_batches(),
             private_snapshots = snapshots(), parallel_landing = parallel_landing(), merge_workers = merge_workers(),
             resident_rehash = crate::host::next_resident_rehash(), resident_merge = resident_merge(),
             "Relay Next R6: resident merge results; legacy Relay disabled"
@@ -367,6 +392,10 @@ impl Ticket {
                 .unwrap_or_else(|e| crate::host::fail(format_args!("Relay Next signal failed for {} fence {target}: {e}", self.number)));
         }
         self.groups += 1;
+        if self.progress.pending > 2 && trace() {
+            tracing::info!(submission = self.number, target, pending = self.progress.pending,
+                "Relay Next R9b multiple title batches in flight");
+        }
         if self.progress.pending == 2 {
             static PAIRS: AtomicU64 = AtomicU64::new(0);
             let pairs = PAIRS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -472,11 +501,22 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_eight_batches_need_final_fence_and_reject_ninth() {
+        let mut p = Progress::new();
+        for f in 11..=18 { assert!(p.enqueue_bounded(f, 8)); }
+        assert_eq!(p.peak, 8);
+        assert!(!p.enqueue_bounded(19, 9));
+        assert!(!p.completed(17));
+        assert!(!p.visible());
+        assert!(p.completed(18));
+        assert!(p.visible());
+    }
+    #[test]
     fn scheduler_five_batches_need_final_fence_and_reject_sixth() {
         let mut p = Progress::new();
         for f in 11..=15 { assert!(p.enqueue_bounded(f, 5)); }
         assert_eq!(p.peak, 5);
-        assert!(!p.enqueue_bounded(16, 6));
+        assert!(!p.enqueue_bounded(16, 5));
         assert!(!p.completed(14));
         assert!(!p.visible());
         assert!(p.completed(15));
