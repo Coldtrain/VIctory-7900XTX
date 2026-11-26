@@ -4,6 +4,7 @@ param(
     [switch]$RNext,
     [switch]$CoolFoxResidency,
     [switch]$CoolFoxThin,
+    [ValidateSet('quality','balanced','performance')][string]$Fsr4K,
     [hashtable]$More = @{}
 )
 
@@ -99,9 +100,23 @@ if ($CoolFoxThin) {
     $settings.VICTORY_LOG = 'warn,victory_gpu::host=info,victory_gpu::relay_next=info,victory_gpu::list::thin=info,victory_gpu::queue::behind=info'
 }
 $settings.VICTORY_LOG = 'warn,victory_gpu=info,victory_loader=info'
+if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }
 foreach ($name in $More.Keys) { $settings[$name] = $More[$name] }
+$console = 'series-s'
+if ($settings.VICTORY_FSR_4K -and $settings.VICTORY_FSR_4K -ne '0') {
+    $console = 'series-x'
+    $settings.VICTORY_OWN_UPSCALER = '0'
+    $settings.VICTORY_RENDER_SCALE = '0'
+    $settings.VICTORY_PORT_TEXTURE_PRELUDE = '0'
+    $settings.VICTORY_RELAY = '0'
+    $settings.VICTORY_LATE_WAIT = '0'
+    $settings.VICTORY_RELAY_NEXT = '0'
+    $settings.VICTORY_ASYNC_SUBMIT = '0'
+    $settings.VICTORY_THIN = '0'
+    $settings.VICTORY_LOG = 'warn,victory_gpu=info,victory_loader=info,victory_hle::modules::fidelityfx=info'
+}
 
-$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR'
+$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_FIDELITYFX_DIR'
 $reset = @(Get-ChildItem Env:VICTORY_* | Where-Object Name -NotIn $paths)
 $before = @{}
 Push-Location -LiteralPath $root
@@ -112,7 +127,7 @@ try {
         [Environment]::SetEnvironmentVariable($name, $settings[$name], 'Process')
     }
     Start-Process -FilePath $victory `
-        -ArgumentList "run `"$game`" --execute --console series-s" `
+        -ArgumentList "run `"$game`" --execute --console $console" `
         -NoNewWindow -Wait `
         -RedirectStandardOutput "$root\victory.log" `
         -RedirectStandardError "$root\victory-errors.log"
