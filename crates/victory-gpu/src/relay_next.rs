@@ -163,6 +163,31 @@ pub(crate) fn refresh_index_stats(before: usize, after: usize) {
     }
 }
 
+/// R12a: distinct ticket lifetimes for dependency-admitted title parts.
+pub(crate) fn ticket_overlap() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| dependency_batches() && std::env::var_os("VICTORY_RELAY_NEXT_TICKET_OVERLAP").is_some_and(|v| v == "1"))
+}
+
+pub(crate) fn overlap_stats(paired: bool, queued: bool) {
+    static TRIED: AtomicU64 = AtomicU64::new(0);
+    static PAIRED: AtomicU64 = AtomicU64::new(0);
+    static QUEUED: AtomicU64 = AtomicU64::new(0);
+    if queued {
+        let count = QUEUED.fetch_add(1, Ordering::Relaxed) + 1;
+        if count == 1 || count.is_multiple_of(256) || trace() {
+            tracing::info!(pairs_queued = count, outstanding_tickets = 2, "Relay Next R12a two title tickets queued");
+        }
+    } else {
+        let calls = TRIED.fetch_add(1, Ordering::Relaxed) + 1;
+        if paired { PAIRED.fetch_add(1, Ordering::Relaxed); }
+        if calls == 1 || calls.is_multiple_of(256) || trace() {
+            tracing::info!(calls, admitted = PAIRED.load(Ordering::Relaxed), pairs_queued = QUEUED.load(Ordering::Relaxed),
+                "Relay Next R12a ticket admission statistics");
+        }
+    }
+}
+
 pub(crate) fn snapshots() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| paired() && std::env::var_os("VICTORY_RELAY_NEXT_SNAPSHOTS").is_none_or(|v| v != "0"))
@@ -419,7 +444,7 @@ impl Ticket {
     pub(crate) fn new(number: u64) -> Self {
         static START: std::sync::Once = std::sync::Once::new();
         START.call_once(|| tracing::info!(
-            mode = mode(), max_batches = if scheduler() { scheduler_parts().max(2) + usize::from(scheduler_parts() >= 2) } else if paired() { 2 } else { 1 }, max_title_tickets = 1, copy_queue = false,
+            mode = mode(), max_batches = if scheduler() { scheduler_parts().max(2) + usize::from(scheduler_parts() >= 2) } else if paired() { 2 } else { 1 }, max_title_tickets = if ticket_overlap() { 2 } else { 1 }, copy_queue = false,
             independent_scheduler = scheduler(), queue_depth = scheduler_depth(), dependency_batches = dependency_batches(),
             private_snapshots = snapshots(), parallel_landing = parallel_landing(), merge_workers = merge_workers(),
             resident_rehash = crate::host::next_resident_rehash(), resident_merge = resident_merge(),
@@ -506,6 +531,17 @@ impl Ticket {
         }
     }
 
+    /// A later ticket's checked fence wait on the same queue proves
+    /// completion of this earlier ticket too. Do not arm the shared event
+    /// again or release any recording until the common landing is done.
+    pub(crate) fn observe_completed(&mut self, device: &ID3D12Device, fence: &ID3D12Fence) {
+        self.check_device(device);
+        let actual = unsafe { fence.GetCompletedValue() };
+        if !self.progress.completed(actual) {
+            crate::host::fail(format_args!("Relay Next R12a incomplete earlier ticket {} at fence {actual}", self.number));
+        }
+    }
+
     pub(crate) fn check_device(&self, device: &ID3D12Device) {
         if let Err(e) = unsafe { device.GetDeviceRemovedReason() } {
             crate::host::fail(format_args!("Relay Next submission {} failed before CPU-visible completion: {e}", self.number));
@@ -559,6 +595,21 @@ mod tests {
         assert!(!disjoint_pages(vec![(4096, 8192), (4096, 8192)]));
         assert!(!disjoint_pages(vec![(0, 8192), (4096, 12288)]));
         assert!(!disjoint_pages(vec![(1, 1)]));
+    }
+
+    #[test]
+    fn two_tickets_keep_independent_completion_state() {
+        let mut first = Progress::new();
+        let mut second = Progress::new();
+        assert!(first.sent(10));
+        assert!(second.enqueue(11, 2));
+        assert!(second.enqueue(12, 2));
+        assert!(!first.visible());
+        assert!(!second.completed(10));
+        assert!(second.completed(12));
+        assert!(first.completed(12));
+        assert!(first.visible());
+        assert!(second.visible());
     }
 
     #[test]

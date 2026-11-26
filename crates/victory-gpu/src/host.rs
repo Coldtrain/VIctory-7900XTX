@@ -6293,12 +6293,29 @@ impl Host {
         prep_checkpoint(&self.device, "submit: gathering what to ask about");
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         let mut next_ticket = crate::relay_next::enabled().then(|| crate::relay_next::Ticket::new(this_submission));
+        // Only split work that R9 has already admitted as one dependency-
+        // checked group. No shared recording may be owned by two tickets.
+        // Keep one preparation/landing transaction and the submission lock.
+        let ticket_cut = if crate::relay_next::ticket_overlap() && !late {
+            parts.first().copied().filter(|&cut| cut > 0 && cut < runs.len()
+                && runs[..cut].iter().all(|a| runs[cut..].iter().all(|b|
+                    !std::sync::Arc::ptr_eq(&a.next_lease, &b.next_lease))))
+        } else { None };
+        if crate::relay_next::ticket_overlap() {
+            crate::relay_next::overlap_stats(ticket_cut.is_some(), false);
+        }
+        let second_number = ticket_cut.map(|_| STARTED.fetch_add(1, Ordering::AcqRel) + 1);
+        let mut second_ticket = second_number.map(crate::relay_next::Ticket::new);
         if let Some(ticket) = next_ticket.as_mut() {
             if late {
                 fail(format_args!("Relay Next R3 cannot use legacy late submission"));
             }
-            for list in runs {
+            let cut = ticket_cut.unwrap_or(runs.len());
+            for list in &runs[..cut] {
                 ticket.claim(&list.next_lease);
+            }
+            if let Some(second) = second_ticket.as_mut() {
+                for list in &runs[cut..] { second.claim(&list.next_lease); }
             }
         }
         // The ranges shaders write are counted for it (with the relay).
@@ -6583,16 +6600,21 @@ impl Host {
             vec![&lists[..]]
         };
         if let Some(ticket) = next_ticket.as_mut() {
-            for list in runs {
-                list.next_pin(ticket);
+            let cut = ticket_cut.unwrap_or(runs.len());
+            for list in &runs[..cut] { list.next_pin(ticket); }
+            if let Some(second) = second_ticket.as_mut() {
+                for list in &runs[cut..] { list.next_pin(second); }
             }
+            // The common preparation/compare and snapshot belong to the
+            // final landing; the plan stays alive through both tickets.
+            let landing = second_ticket.as_mut().unwrap_or(ticket);
             if let Some(plan) = &card {
                 for (_, (allocator, list)) in &plan.lists {
-                    ticket.pin(allocator);
-                    ticket.pin(list);
+                    landing.pin(allocator);
+                    landing.pin(list);
                 }
                 for range in &plan.ranges {
-                    ticket.pin(&range.shadow.buffer);
+                    landing.pin(&range.shadow.buffer);
                 }
             }
         }
@@ -6601,14 +6623,23 @@ impl Host {
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
-            if let Some(ticket) = next_ticket.as_mut() {
+            let split_tickets = second_ticket.is_some();
+            let active = if split_tickets && i > 0 { second_ticket.as_mut() } else { next_ticket.as_mut() };
+            if let Some(ticket) = active {
                 // Block staged visible descriptor updates while both batches
                 // are queued. Publish the last fence before releasing the
                 // gate so writers cannot overwrite a live GPU descriptor.
                 if crate::relay_next::paired() && next_descriptor_horizon.is_none() {
                     next_descriptor_horizon = Some(DESCRIPTOR_HORIZON.lock().unwrap_or_else(|e| e.into_inner()));
                 }
-                ticket.send(&self.device, &self.queue, &self.fence, *submitted, group, paired_batches, groups.len(), || self.card_sent());
+                let ticket_batches = if split_tickets {
+                    if i == 0 { 1 } else { groups.len() - 1 }
+                } else { groups.len() };
+                ticket.send(&self.device, &self.queue, &self.fence, *submitted, group,
+                    paired_batches, ticket_batches, || self.card_sent());
+                if split_tickets && i == 1 {
+                    crate::relay_next::overlap_stats(true, true);
+                }
                 if let Some(horizon) = next_descriptor_horizon.as_mut() {
                     **horizon = *submitted;
                 }
@@ -6620,6 +6651,12 @@ impl Host {
                     #[cfg(feature = "diagnostics")]
                     let _card = crate::timeline::card_wait(Some(*submitted));
                     ticket.wait(&self.device, &self.fence, self.event);
+                    if split_tickets {
+                        // The final fence is on the same queue, and covers
+                        // every earlier ticket. Both remain pinned for CPU
+                        // visibility, which happens only after copyback.
+                        next_ticket.as_mut().expect("first R12a ticket").observe_completed(&self.device, &self.fence);
+                    }
                     stood(started);
                     working(true);
                 }
@@ -6772,8 +6809,10 @@ impl Host {
         }
         if let Some(ticket) = next_ticket.take() {
             ticket.finish(&self.device);
-            FINISHED.store(this_submission, Ordering::Release);
-            bury(this_submission);
+            if let Some(second) = second_ticket.take() { second.finish(&self.device); }
+            let finished = second_number.unwrap_or(this_submission);
+            FINISHED.store(finished, Ordering::Release);
+            bury(finished);
         }
         self.log_messages();
         submitting(0, 0);
