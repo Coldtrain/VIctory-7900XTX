@@ -82,6 +82,9 @@ pub(super) trait Work: Send {
     {
         Err(next)
     }
+    /// Flush independently submitted work before acknowledging a look.
+    fn flush() {}
+    fn pending() -> bool { false }
     /// Does it. `forced`: its wait was not met.
     fn go(self, forced: bool);
 }
@@ -191,7 +194,7 @@ impl<W: Work> Lane<W> {
             self.lock().items.iter().filter(|e| e.what.folded()).filter_map(|e| e.what.ask()).collect();
         folded.iter().for_each(W::settle);
         let mut state = self.lock();
-        if state.items.is_empty() && state.running.is_empty() {
+        if state.items.is_empty() && state.running.is_empty() && !W::pending() {
             return;
         }
         state.asked += 1;
@@ -251,6 +254,7 @@ impl<W: Work> Lane<W> {
     /// Does what is free to run of the entries before number `limit`.
     pub(super) fn look(&self, limit: u64) {
         while self.step(limit) {}
+        W::flush();
     }
 
     /// The parts of `entry`, which stands for them, in place `at`.
@@ -574,7 +578,20 @@ impl Work for Job {
         Ok(run)
     }
 
+    fn flush() {
+        crate::host::next_drain();
+    }
+
+    fn pending() -> bool {
+        crate::host::next_flight_pending()
+    }
+
     fn go(self, forced: bool) {
+        // Never publish a fence, present or pass a wait while a deferred
+        // recording is outstanding. The lane is the only producer.
+        if !matches!(&self, Job::Run(..) | Job::Joined(..)) {
+            crate::host::next_drain();
+        }
         let began = Instant::now();
         let _doing = crate::timeline::span(match self {
             Job::Run(..) => "the line: a submission",
@@ -858,7 +875,9 @@ fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
 /// nothing, behind the flights in the air, or now.
 pub(super) fn signal(this: This, fence: This, value: u64) {
     let fence = fence as usize;
-    LANE.push_behind(this as usize, false, Job::Signal(fence, value), || {
+    // A queue may have a detached flight no longer in running/items.
+    // Queue signals rather than publishing them from the title thread.
+    LANE.push_behind(this as usize, crate::host::next_flight_pending(), Job::Signal(fence, value), || {
         if !crate::host::late_signal(fence, value) {
             crate::fence::set(fence as This, value);
         }

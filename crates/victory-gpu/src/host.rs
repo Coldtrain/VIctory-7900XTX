@@ -2967,6 +2967,8 @@ type Declared = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
 /// What [`Host::submit`] hands back for a submission it sent and did not
 /// wait for.
 struct Sent {
+    /// Only R12c's no-copyback path carries an independent live ticket.
+    next: Option<crate::relay_next::Ticket>,
     /// Its number among the submissions started.
     number: u64,
     card: Option<CardPlan>,
@@ -2977,6 +2979,67 @@ struct Sent {
     texture_back_ranges: Vec<(usize, usize)>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+}
+
+/// An independent flight owns the entire detached recording, not just
+/// the COM command list. It has no pending title writes or readbacks.
+struct NextFlight {
+    number: u64,
+    fence: u64,
+    ticket: crate::relay_next::Ticket,
+    lists: Vec<crate::list::Detached>,
+    order: Vec<usize>,
+}
+// SAFETY: as for Line: detached recordings have one owner, and all
+// accesses to this slot are serialized by the host submission lock.
+unsafe impl Send for NextFlight {}
+static NEXT_FLIGHT: Mutex<Option<NextFlight>> = Mutex::new(None);
+static NEXT_FLIGHT_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn next_flight_slot() -> std::sync::MutexGuard<'static, Option<NextFlight>> {
+    NEXT_FLIGHT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub(crate) fn next_flight_pending() -> bool {
+    NEXT_FLIGHT_LIVE.load(Ordering::Acquire)
+}
+
+/// Called by the submission lane at visibility boundaries and before
+/// reporting that its drain is done. Never from inside Host::submit.
+pub(crate) fn next_drain() {
+    if !next_flight_pending() { return; }
+    if let Some(host) = host() {
+        let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        host.next_drain_locked(&mut submitted);
+        drop(submitted);
+        land();
+    }
+}
+
+/// A later submission may prepare only GPU-private carded refreshes
+/// and declarations while the earlier read-only flight is outstanding.
+/// In-place memory, mapped upload fills, textures and opaque CPU steps
+/// may share backing storage with the earlier GPU work: drain first.
+fn next_independent_prepare(runs: &[&HostList]) -> bool {
+    !crate::picked::on() && !upcheck::on() && runs.iter().all(|list| {
+        let d = list.deferred();
+        d.copies.iter().all(|step| match step {
+            Step::Refresh(shadow, ..) | Step::GpuWrite(shadow, ..) =>
+                shadow.carded() && !shadow.in_place(),
+            _ => false,
+        })
+    })
+}
+
+/// No result can be observed by the title before the later drain.
+/// The actual card plan and declared ranges are checked again after prep.
+fn next_no_visibility(runs: &[&HostList]) -> bool {
+    !crate::picked::on() && !upcheck::on() && runs.iter().all(|list| {
+        let d = list.deferred();
+        d.writes.is_empty() && d.backs.is_empty() && d.back_wanted.is_empty()
+            && d.texture_backs.is_empty() && d.gpu_written.is_empty()
+            && d.copies.iter().all(|step| !matches!(step, Step::GpuWrite(..) | Step::Placed(..) | Step::Run(..)))
+    })
 }
 
 /// A submission on the card that has not been waited for ([`late`]): its
@@ -5901,7 +5964,8 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // Behind what the title's queues were given before it.
         crate::queue::before_sync();
-        let _ = self.submit(runs, &[], false);
+        let _ = self.submit(runs, &[], false, false);
+        if crate::relay_next::independent_flights() { land(); }
     }
 
     /// A queue's submission with [`late`]: the host lists `lists`, taken
@@ -5923,14 +5987,23 @@ impl Host {
         }
         if crate::relay_next::scheduler() {
             let began = std::time::Instant::now();
-            {
+            let sent = {
                 let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
-                // Keep the stable synchronous landing path and its ticket
-                // ownership. Only the submitting title thread runs ahead.
-                let _ = self.submit(&runs, parts, false);
-            }
+                self.submit(&runs, parts, false, crate::relay_next::independent_flights())
+            };
             crate::relay_next::scheduler_stats(parts.len() + 1, order.len(), began.elapsed().as_micros() as u64);
-            crate::list::recycle(lists, &order);
+            if let Some((submitted, mut sent)) = sent {
+                let ticket = sent.next.take().expect("R12c independent ticket");
+                let mut slot = next_flight_slot();
+                assert!(slot.is_none(), "R12c independent flight bound");
+                *slot = Some(NextFlight { number: sent.number, fence: *submitted, ticket, lists, order });
+                NEXT_FLIGHT_LIVE.store(true, Ordering::Release);
+                drop(slot);
+                drop(submitted);
+            } else {
+                crate::list::recycle(lists, &order);
+            }
+            if crate::relay_next::independent_flights() { land(); }
             return;
         }
         late_threads();
@@ -5955,7 +6028,7 @@ impl Host {
     fn send_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
-            self.submit(&runs, parts, true)
+            self.submit(&runs, parts, true, false)
         };
         let Some((mut submitted, sent)) = sent else {
             // (Not reached: a submission sent ahead always comes back.)
@@ -6015,7 +6088,7 @@ impl Host {
     /// it ran and was waited for after all.
     fn execute_own(&self, list: &HostList) -> u64 {
         late_threads();
-        let Some((submitted, sent)) = self.submit(&[list], &[], true) else {
+        let Some((submitted, sent)) = self.submit(&[list], &[], true, false) else {
             return 0;
         };
         let number = sent.number;
@@ -6048,6 +6121,29 @@ impl Host {
         RELAY_MOVED.notify_one();
         drop(submitted);
         number
+    }
+
+    /// R12c uses the same shared event only while holding submitted.
+    /// Finish the earlier ticket in order; recycle outside that lock.
+    fn next_drain_locked(&self, _submitted: &mut u64) {
+        let Some(mut flight) = next_flight_slot().take() else { return; };
+        let waiting = std::time::Instant::now();
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        if completed == u64::MAX || completed >= flight.fence {
+            flight.ticket.observe_completed(&self.device, &self.fence);
+        } else {
+            let was_working = working(false);
+            flight.ticket.wait(&self.device, &self.fence, self.event);
+            stood(waiting);
+            working(was_working);
+            SUBMISSION_US[1].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        flight.ticket.finish(&self.device);
+        FINISHED.store(flight.number, Ordering::Release);
+        bury(flight.number);
+        line().landed.push((flight.lists, flight.order));
+        NEXT_FLIGHT_LIVE.store(false, Ordering::Release);
+        crate::relay_next::flight_stats(4);
     }
 
     /// Waits for the card to run every flight in the air ([`late`]) and
@@ -6248,7 +6344,7 @@ impl Host {
     /// `parts`: the lists of `runs` at which another part begins
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
-    fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+    fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool, next_fly: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -6257,6 +6353,18 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut earlier = next_flight_slot().as_ref().map(|flight| flight.fence);
+        if earlier.is_some() && (!next_fly || !parts.is_empty() || !next_independent_prepare(runs)) {
+            crate::relay_next::flight_stats(5);
+            self.next_drain_locked(&mut submitted);
+            earlier = None;
+        }
+        if next_fly {
+            crate::relay_next::flight_stats(0);
+            if earlier.is_some_and(|target| unsafe { self.fence.GetCompletedValue() } < target) {
+                crate::relay_next::flight_stats(2);
+            }
+        }
         let was_working = working(true);
         submitting(1, runs.len());
         prep_checkpoint(&self.device, "submission entry");
@@ -6313,7 +6421,7 @@ impl Host {
         // sweep waits for a submission that finds none in the air: there is
         // one at every present).
         static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        if !behind {
+        if !behind && earlier.is_none() {
             if upcheck::on() {
                 upcheck::at_rest(self);
             }
@@ -6579,6 +6687,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::copystat::submission_ends(lock);
             let sent = Sent {
+                next: None,
                 number: this_submission,
                 card,
                 back,
@@ -6659,6 +6768,14 @@ impl Host {
                 }
             }
         }
+        // At most one independently deferred ticket plus the current
+        // ticket. Never defer a group, or any plan that needs landing.
+        let defer_next = next_fly && earlier.is_none() && parts.is_empty()
+            && second_ticket.is_none() && card.is_none() && declared.is_empty()
+            && picked.written.is_empty() && picked.looked.is_empty()
+            && groups.len() == 1 && next_no_visibility(runs);
+        #[cfg(feature = "diagnostics")]
+        let defer_next = defer_next && stamp.is_none();
         submitting(2, runs.len());
         let mut next_descriptor_horizon = None;
         let mut compare_pending = card.as_ref().is_some_and(|plan| plan.check_pending);
@@ -6687,6 +6804,9 @@ impl Host {
                 let ticket_batches = if split_tickets {
                     if i == 0 { 1 } else { groups.len() - 1 }
                 } else { groups.len() };
+                if i == 0 && earlier.is_some_and(|target| unsafe { self.fence.GetCompletedValue() } < target) {
+                    crate::relay_next::flight_stats(3);
+                }
                 ticket.send(&self.device, &self.queue, &self.fence, *submitted, group,
                     paired_batches, ticket_batches, || self.card_sent());
                 if split_tickets && i == 1 {
@@ -6699,6 +6819,12 @@ impl Host {
                 crate::timeline::sent(sending, *submitted, stamp);
                 if !paired_batches || i + 1 == groups.len() {
                     drop(next_descriptor_horizon.take());
+                    if defer_next {
+                        // The queue has accepted the command list and its
+                        // fence. Leave the lease pinned; the lane transfers
+                        // ownership of the detached recording under this lock.
+                        continue;
+                    }
                     working(false);
                     #[cfg(feature = "diagnostics")]
                     let _card = crate::timeline::card_wait(Some(*submitted));
@@ -6772,6 +6898,24 @@ impl Host {
             fail(format_args!("Relay Next R12b comparison was not submitted"));
         }
         let _ = &firsts;
+        if defer_next {
+            let ticket = next_ticket.take().expect("R12c ticket ownership");
+            crate::relay_next::flight_stats(1);
+            SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
+            submitting(0, 0);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::submission_ends(lock);
+            working(was_working);
+            return Some((submitted, Sent {
+                next: Some(ticket), number: this_submission, card: None, back: Vec::new(),
+                own: None, texture_back_ranges: Vec::new(), writes: Vec::new(),
+            }));
+        }
+        if earlier.is_some() {
+            // The later final fence covers the earlier one. Retire the
+            // earlier recording first, before advancing FINISHED.
+            self.next_drain_locked(&mut submitted);
+        }
         if next_ticket.is_none() {
             FINISHED.store(this_submission, Ordering::Release);
             bury(this_submission);

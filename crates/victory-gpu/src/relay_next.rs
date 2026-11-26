@@ -214,6 +214,29 @@ pub(crate) fn compare_overlap_stats(us: u64, pending_before: bool, pending_after
     }
 }
 
+/// R12c: a separate earlier ticket may remain on the direct queue
+/// while an independently submitted ticket is prepared. No legacy Relay.
+pub(crate) fn independent_flights() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| ticket_overlap() && std::env::var_os("VICTORY_RELAY_NEXT_INDEPENDENT_FLIGHTS").is_some_and(|v| v == "1"))
+}
+
+/// Counts the independent path separately from R12a's grouped tickets.
+pub(crate) fn flight_stats(kind: usize) {
+    static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+    let count = COUNTS[kind].fetch_add(1, Ordering::Relaxed) + 1;
+    if count == 1 || count.is_multiple_of(256) || trace() {
+        tracing::info!(
+            considered = COUNTS[0].load(Ordering::Relaxed),
+            deferred = COUNTS[1].load(Ordering::Relaxed),
+            prep_overlaps = COUNTS[2].load(Ordering::Relaxed),
+            queue_overlaps = COUNTS[3].load(Ordering::Relaxed),
+            drained = COUNTS[4].load(Ordering::Relaxed),
+            hazard_drains = COUNTS[5].load(Ordering::Relaxed),
+            "Relay Next R12c independent flight statistics");
+    }
+}
+
 pub(crate) fn snapshots() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| paired() && std::env::var_os("VICTORY_RELAY_NEXT_SNAPSHOTS").is_none_or(|v| v != "0"))
