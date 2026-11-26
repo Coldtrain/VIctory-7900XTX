@@ -6434,8 +6434,17 @@ impl Host {
                 self.next_retire_one(&mut submitted);
             }
         }
+        // R12i: an already dependency-admitted joined run can stay in
+        // the independent FIFO if it has no CPU-visible writes and its
+        // preparation is safe beside an earlier GPU flight. Keep the
+        // original ExecuteCommandLists boundaries; use one lease ticket
+        // for the joined group and retire it at its final fence.
+        let joined_flight = next_fly && multi && crate::relay_next::paired()
+            && !parts.is_empty() && next_independent_prepare(runs) && next_no_visibility(runs);
+        #[cfg(feature = "diagnostics")]
+        let joined_flight = joined_flight && !timing();
         let mut earlier = next_flight_slot().back().map(|flight| flight.fence);
-        if earlier.is_some() && (!next_fly || !parts.is_empty() || !next_independent_prepare(runs)) {
+        if earlier.is_some() && (!next_fly || (!parts.is_empty() && !joined_flight) || !next_independent_prepare(runs)) {
             crate::relay_next::flight_stats(5);
             self.next_drain_locked(&mut submitted);
             earlier = None;
@@ -6526,7 +6535,7 @@ impl Host {
         // Only split work that R9 has already admitted as one dependency-
         // checked group. No shared recording may be owned by two tickets.
         // Keep one preparation/landing transaction and the submission lock.
-        let ticket_cut = if crate::relay_next::ticket_overlap() && !late {
+        let ticket_cut = if crate::relay_next::ticket_overlap() && !late && !joined_flight {
             parts.first().copied().filter(|&cut| cut > 0 && cut < runs.len()
                 && runs[..cut].iter().all(|a| runs[cut..].iter().all(|b|
                     !std::sync::Arc::ptr_eq(&a.next_lease, &b.next_lease))))
@@ -6849,12 +6858,13 @@ impl Host {
                 }
             }
         }
-        // At most one independently deferred ticket plus the current
-        // ticket. Never defer a group, or any plan that needs landing.
-        let defer_next = next_fly && (earlier.is_none() || multi) && parts.is_empty()
+        // Do not defer any plan that needs CPU landing. R12i permits
+        // a dependency-admitted read-only joined group as a single
+        // ticket spanning the original queue submission boundaries.
+        let defer_next = next_fly && (earlier.is_none() || multi) && (parts.is_empty() || joined_flight)
             && second_ticket.is_none() && card.is_none() && declared.is_empty()
             && picked.written.is_empty() && picked.looked.is_empty()
-            && groups.len() == 1 && next_no_visibility(runs)
+            && (groups.len() == 1 || (joined_flight && paired_batches)) && next_no_visibility(runs)
             && !crate::memory::asked_sizes(runs.iter().copied());
         #[cfg(feature = "diagnostics")]
         let defer_next = defer_next && stamp.is_none();
@@ -6999,6 +7009,14 @@ impl Host {
         }
         let _ = &firsts;
         if defer_next {
+            if joined_flight {
+                static JOINED_FLIGHTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let count = JOINED_FLIGHTS.fetch_add(1, Ordering::Relaxed) + 1;
+                if count == 1 || count.is_multiple_of(256) {
+                    tracing::info!(count, batches = groups.len(), earlier = earlier.is_some(),
+                        "Relay Next R12i joined read-only flight deferred");
+                }
+            }
             let ticket = next_ticket.take().expect("R12c ticket ownership");
             crate::relay_next::flight_stats(1);
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
