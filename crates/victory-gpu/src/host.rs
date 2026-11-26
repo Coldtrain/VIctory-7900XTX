@@ -2125,6 +2125,15 @@ struct NextSnapshot {
     differs: (ID3D12Resource, usize, u64),
     fetch: Prelude,
     fetched: Mutex<Option<(ID3D12Resource, usize, u64)>>,
+    copy: Option<NextCopy>,
+}
+
+/// Private copy queue, allocator and fence. Only used under the submission
+/// lock after the direct queue has finished, and waited before recycling.
+struct NextCopy {
+    list: Prelude,
+    queue: ID3D12CommandQueue,
+    fence: ID3D12Fence,
 }
 
 struct CardWork {
@@ -4468,7 +4477,10 @@ impl Host {
                     fail(format_args!("Relay Next: cannot allocate private fetch command list")));
                 name(&buffer, || "Relay Next private comparison results".into());
                 tracing::info!(bytes, "Relay Next R4: private snapshot storage allocated");
-                NextSnapshot { differs: (buffer, data as usize, bytes), fetch, fetched: Mutex::new(None) }
+                let copy = if crate::relay_next::copy_queue() {
+                    self.make_next_copy()
+                } else { None };
+                NextSnapshot { differs: (buffer, data as usize, bytes), fetch, fetched: Mutex::new(None), copy }
             }))
         } else { None };
         let differs = next_snapshot.as_ref().map_or(&work.differs, |s| &s.differs);
@@ -4747,6 +4759,35 @@ impl Host {
         // not read yet: the area starts again only when none is out.
         if !relay() || work.out == 0 {
             work.taken = 0;
+        }
+    }
+
+    /// R8 preview: independent copy queue and allocator. A failed creation
+    /// leaves the original direct-queue path unchanged.
+    fn make_next_copy(&self) -> Option<NextCopy> {
+        let made = unsafe {
+            (|| -> windows::core::Result<NextCopy> {
+                let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
+                let list: ID3D12GraphicsCommandList =
+                    self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
+                list.Close()?;
+                let queue: ID3D12CommandQueue = self.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                    ..Default::default()
+                })?;
+                let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+                Ok(NextCopy { list: (allocator, list), queue, fence })
+            })()
+        };
+        match made {
+            Ok(copy) => {
+                tracing::info!("Relay Next R8 preview: dedicated copy queue created");
+                Some(copy)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Relay Next R8 preview: copy queue unavailable; using direct queue");
+                None
+            }
         }
     }
 
@@ -5253,16 +5294,30 @@ impl Host {
         }
         let mut written = vec![0usize; plan.ranges.len()];
         if !pieces.is_empty() {
+            let copy = plan.next_snapshot.as_ref().and_then(|snapshot| snapshot.copy.as_ref());
             let mut leased_fetch;
             let (fetch_buffer, fetch_list) = if let Some(snapshot) = &plan.next_snapshot {
                 leased_fetch = snapshot.fetched.lock().unwrap_or_else(|e| e.into_inner());
-                (&mut *leased_fetch, &snapshot.fetch)
+                (&mut *leased_fetch, copy.map_or(&snapshot.fetch, |c| &c.list))
             } else {
                 (&mut work.fetched, &work.fetch)
             };
             if fetch_buffer.as_ref().is_none_or(|f| f.2 < total) {
                 let size = total.next_multiple_of(16 << 20);
-                *fetch_buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+                *fetch_buffer = if copy.is_some() {
+                    self.read_back_buffer(size).and_then(|buffer| {
+                        let mut data = std::ptr::null_mut();
+                        match unsafe { buffer.Map(0, None, Some(&mut data)) } {
+                            Ok(()) => Some((buffer, data as usize, size)),
+                            Err(e) => {
+                                tracing::warn!(error = %e, size, "Relay Next R8 preview: readback map failed");
+                                None
+                            }
+                        }
+                    })
+                } else {
+                    self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size))
+                };
                 if plan.next_snapshot.is_some() {
                     tracing::info!(size, "Relay Next R4: private fetch storage resized");
                 }
@@ -5282,18 +5337,30 @@ impl Host {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
-                    self.card_sent();
-                    *submitted += 1;
-                    self.queue.Signal(&self.fence, *submitted)?;
-                    self.fence.SetEventOnCompletion(*submitted, self.event)?;
+                    let fence = if let Some(copy) = copy {
+                        // Render and compare have already completed under
+                        // this lock. Explicitly order the copy queue behind
+                        // that fence as well. Buffers decay to COMMON after
+                        // the completed direct queue ExecuteCommandLists.
+                        copy.queue.Wait(&self.fence, *submitted)?;
+                        copy.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                        copy.queue.Signal(&copy.fence, *submitted)?;
+                        &copy.fence
+                    } else {
+                        self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                        self.card_sent();
+                        *submitted += 1;
+                        self.queue.Signal(&self.fence, *submitted)?;
+                        &self.fence
+                    };
+                    fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
                     let status = WaitForSingleObject(self.event, INFINITE);
                     stood(waiting);
                     working(was_working);
                     if crate::relay_next::enabled() {
                         self.device.GetDeviceRemovedReason()?;
-                        let completed = self.fence.GetCompletedValue();
+                        let completed = fence.GetCompletedValue();
                         if status != windows::Win32::Foundation::WAIT_OBJECT_0 || completed == u64::MAX || completed < *submitted {
                             return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80004005u32 as i32)));
                         }
@@ -5310,6 +5377,9 @@ impl Host {
                 CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
                 CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
                 CARD_STATS[6].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+            if copy.is_some() {
+                crate::relay_next::copy_stats(total, waiting.elapsed().as_micros() as u64);
             }
             let merging = std::time::Instant::now();
             let next_parallel = crate::relay_next::parallel_landing();

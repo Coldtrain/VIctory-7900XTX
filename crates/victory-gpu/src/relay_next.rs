@@ -47,6 +47,26 @@ pub(crate) fn resident_merge() -> bool {
     *ON.get_or_init(|| resident_rehash() && std::env::var_os("VICTORY_RELAY_NEXT_RESIDENT_MERGE").is_none_or(|v| v != "0"))
 }
 
+/// Independent R8 preview; intentionally opt-in until hardware-tested.
+pub(crate) fn copy_queue() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| snapshots() && std::env::var_os("VICTORY_RELAY_NEXT_COPY_QUEUE").is_some_and(|v| v == "1"))
+}
+
+pub(crate) fn copy_stats(bytes: u64, elapsed_us: u64) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static BYTES: AtomicU64 = AtomicU64::new(0);
+    static US: AtomicU64 = AtomicU64::new(0);
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    BYTES.fetch_add(bytes, Ordering::Relaxed);
+    US.fetch_add(elapsed_us, Ordering::Relaxed);
+    if calls == 1 || calls.is_multiple_of(256) || trace() {
+        tracing::info!(calls, bytes, elapsed_us,
+            total_bytes = BYTES.load(Ordering::Relaxed), total_us = US.load(Ordering::Relaxed),
+            "Relay Next R8 preview: copy queue readback");
+    }
+}
+
 /// Counts bytes not queued for the redundant merge-result upload. Existing
 /// dirty ranges may still overlap; this is not a hardware bandwidth counter.
 pub(crate) fn resident_stats(bytes: u64, kept: bool) {
@@ -221,7 +241,7 @@ impl Ticket {
     pub(crate) fn new(number: u64) -> Self {
         static START: std::sync::Once = std::sync::Once::new();
         START.call_once(|| tracing::info!(
-            mode = mode(), max_batches = if paired() { 2 } else { 1 }, max_title_tickets = 1, copy_queue = false,
+            mode = mode(), max_batches = if paired() { 2 } else { 1 }, max_title_tickets = 1, copy_queue_requested = copy_queue(),
             private_snapshots = snapshots(), parallel_landing = parallel_landing(), merge_workers = merge_workers(),
             resident_rehash = crate::host::next_resident_rehash(), resident_merge = resident_merge(),
             "Relay Next R6: resident merge results; legacy Relay disabled"
