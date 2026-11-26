@@ -2297,6 +2297,12 @@ pub(crate) fn next_resident_rehash() -> bool {
     crate::relay_next::resident_rehash() && !upcheck::on()
 }
 
+/// R7a changes only the card hash grid, not the CPU write-watch grid.
+/// Keep the old grid for diagnostic upload checks and legacy Relay.
+pub(crate) fn next_card_piece_bytes() -> usize {
+    if next_resident_rehash() { crate::relay_next::readback_piece_bytes() } else { 65536 }
+}
+
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_none_or(|v| v != "0"))
@@ -4356,12 +4362,21 @@ impl Host {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let mut code: Option<ID3DBlob> = None;
+        let grid = next_card_piece_bytes();
+        // Keep shader and CPU indexing identical; the original shader
+        // remains the byte-for-byte baseline when 64 KiB is selected.
+        let shader = if grid == 65536 {
+            std::borrow::Cow::Borrowed(CARD_COMPARE)
+        } else {
+            std::borrow::Cow::Owned(CARD_COMPARE.replace("65536u", &format!("{grid}u")))
+        };
+        tracing::info!(piece_bytes = grid, "Relay Next R7a: card readback grid");
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
         unsafe {
             D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
+                shader.as_ptr().cast(),
+                shader.len(),
                 windows::core::s!("card compare"),
                 None,
                 None,
@@ -4378,7 +4393,9 @@ impl Host {
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
         const RESULTS: u64 = 1 << 20;
-        let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
+        // Same total covered address space as the original result buffer.
+        let results = RESULTS * (65536 / grid as u64);
+        let (differs, data) = self.shared_buffer(results).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
@@ -4402,7 +4419,7 @@ impl Host {
                 fetch: list()?,
                 root,
                 pso,
-                differs: (differs, data as usize, RESULTS),
+                differs: (differs, data as usize, results),
                 fetched: None,
                 taken: 0,
                 out: 0,
@@ -5278,8 +5295,22 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    for &(i, lo, hi, at) in &pieces {
-                        list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
+                    // Adjacent pieces can share one GPU copy command, but
+                    // keep their original merge boundaries and order.
+                    let mut p = 0;
+                    while p < pieces.len() {
+                        let (i, lo, mut hi, at) = pieces[p];
+                        let source = &plan.ranges[i].shadow;
+                        p += 1;
+                        while p < pieces.len() {
+                            let (j, next_lo, next_hi, next_at) = pieces[p];
+                            if !crate::relay_next::fine_readback_on()
+                                || !std::sync::Arc::ptr_eq(source, &plan.ranges[j].shadow)
+                                || next_lo != hi || next_at != at + (hi - lo) as u64 { break; }
+                            hi = next_hi;
+                            p += 1;
+                        }
+                        list.CopyBufferRegion(fetched, at, &source.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
@@ -5310,6 +5341,9 @@ impl Host {
                 CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
                 CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
                 CARD_STATS[6].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+            if crate::relay_next::fine_readback_on() {
+                crate::relay_next::readback_stats(pieces.len(), total, waiting.elapsed().as_micros() as u64);
             }
             let merging = std::time::Instant::now();
             let next_parallel = crate::relay_next::parallel_landing();

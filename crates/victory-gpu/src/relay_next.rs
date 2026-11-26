@@ -47,6 +47,37 @@ pub(crate) fn resident_merge() -> bool {
     *ON.get_or_init(|| resident_rehash() && std::env::var_os("VICTORY_RELAY_NEXT_RESIDENT_MERGE").is_none_or(|v| v != "0"))
 }
 
+/// R7a: finer GPU comparison grid is optional until measured on hardware.
+pub(crate) fn readback_piece_bytes() -> usize {
+    static SIZE: OnceLock<usize> = OnceLock::new();
+    *SIZE.get_or_init(|| {
+        match std::env::var("VICTORY_RELAY_NEXT_READBACK_KB").as_deref() {
+            Ok("16") => 16 << 10,
+            Ok("32") => 32 << 10,
+            _ => 64 << 10,
+        }
+    })
+}
+
+pub(crate) fn fine_readback_on() -> bool {
+    crate::host::next_card_piece_bytes() < 65536
+}
+
+pub(crate) fn readback_stats(pieces: usize, bytes: u64, elapsed_us: u64) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static BYTES: AtomicU64 = AtomicU64::new(0);
+    static US: AtomicU64 = AtomicU64::new(0);
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    BYTES.fetch_add(bytes, Ordering::Relaxed);
+    US.fetch_add(elapsed_us, Ordering::Relaxed);
+    if calls == 1 || calls.is_multiple_of(256) || trace() {
+        tracing::info!(calls, pieces, bytes, elapsed_us,
+            total_bytes = BYTES.load(Ordering::Relaxed),
+            total_us = US.load(Ordering::Relaxed), piece_bytes = readback_piece_bytes(),
+            "Relay Next R7a fine readback statistics");
+    }
+}
+
 /// Counts bytes not queued for the redundant merge-result upload. Existing
 /// dirty ranges may still overlap; this is not a hardware bandwidth counter.
 pub(crate) fn resident_stats(bytes: u64, kept: bool) {

@@ -335,7 +335,7 @@ pub(crate) fn card_stats() -> [u64; 10] {
 /// for each 64 KiB piece (a copy that does not start on a piece boundary
 /// has one piece more).
 pub(crate) fn card_hash_bytes(size: u64) -> u64 {
-    (size / PIECE as u64 + 2) * 16
+    (size / crate::host::next_card_piece_bytes() as u64 + 2) * 16
 }
 
 /// A buffer of `size` bytes in the card's memory for a title buffer's
@@ -794,29 +794,75 @@ pub(crate) struct CardSpan {
 /// [`CardSpan`] for offsets `[from, to)` (`from < to`) of a copy of title
 /// memory from `start` on.
 fn card_span_of(start: usize, from: usize, to: usize) -> CardSpan {
-    let pieces = pieces_of(start, from, to);
+    card_span_grid(start, from, to, crate::host::next_card_piece_bytes())
+}
+
+fn card_span_grid(start: usize, from: usize, to: usize, grid: usize) -> CardSpan {
+    let first = start / grid;
+    let pieces = (start + from) / grid - first..(start + to - 1) / grid - first + 1;
     CardSpan {
         from: from as u32,
         to: to as u32,
         first: pieces.start as u32,
         pieces: pieces.len() as u32,
-        skew: (start % PIECE) as u32,
+        skew: (start % grid) as u32,
     }
+}
+
+fn card_piece_grid(start: usize, len: usize, piece: usize, grid: usize) -> (usize, usize) {
+    let first = start / grid;
+    (((first + piece) * grid).saturating_sub(start),
+        ((first + piece + 1) * grid - start).min(len))
 }
 
 /// The offsets of piece `i` of `span` that lie in the span, for a copy of
 /// `len` bytes of title memory from `start` on: what is fetched and merged
 /// of a piece the compare found differing.
 fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, usize) {
-    let (lo, hi) = piece_at(start, len, (span.first + i) as usize);
+    let (lo, hi) = card_piece_grid(start, len, (span.first + i) as usize, crate::host::next_card_piece_bytes());
     (lo.max(span.from as usize), hi.min(span.to as usize))
 }
 
 /// The offsets [`Shadow::card_hashed`] gives, for a card's buffer of `size`
 /// bytes for title memory from `start` on.
 fn card_hashed_of(start: usize, size: usize, piece: usize) -> (usize, usize) {
-    let (lo, hi) = piece_at(start, size, piece);
+    let (lo, hi) = card_piece_grid(start, size, piece, crate::host::next_card_piece_bytes());
     (lo & !15, hi.next_multiple_of(16))
+}
+
+#[cfg(test)]
+mod fine_card_tests {
+    use super::{card_span_grid, card_piece_grid};
+
+    #[test]
+    fn grids_cover_unaligned_declared_ranges_without_gaps() {
+        for grid in [16384usize, 32768, 65536] {
+            for start in [0usize, 1, 4095, grid - 1, grid + 77] {
+                for (from, to) in [(0, 1), (7, grid + 11), (grid - 1, 3 * grid + 17)] {
+                    let span = card_span_grid(start, from, to, grid);
+                    let mut next = from;
+                    for i in 0..span.pieces {
+                        let (a, b) = card_piece_grid(start, to + 21, (span.first + i) as usize, grid);
+                        let (lo, hi) = (a.max(from), b.min(to));
+                        assert_eq!(lo, next);
+                        assert!(lo < hi && hi - lo <= grid);
+                        // Shader uses the same offset and skew formula.
+                        let piece = (span.first + i) as usize;
+                        assert_eq!(a, (piece * grid).saturating_sub(span.skew as usize));
+                        next = hi;
+                    }
+                    assert_eq!(next, to);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_write_requires_only_one_small_piece() {
+        let span = card_span_grid(0, 0, 65536, 16384);
+        assert_eq!(span.pieces, 4);
+        assert_eq!(card_piece_grid(0, 65536, 2, 16384), (32768, 49152));
+    }
 }
 
 #[cfg(test)]
@@ -4311,7 +4357,7 @@ impl Shadow {
 
     /// The piece that holds offset `at`.
     pub(crate) fn card_piece_of(&self, at: usize) -> u32 {
-        self.pieces(at, at + 1).start as u32
+        card_span_grid(self.start as usize, at, at + 1, crate::host::next_card_piece_bytes()).first
     }
 
     /// The offsets the compare on the card hashes of a piece: what lies of
