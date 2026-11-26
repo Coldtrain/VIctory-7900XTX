@@ -284,9 +284,11 @@ impl Own {
                 state = Some(write);
             }
             let hashed = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
+            // The upload checker can leave a buffer in COPY_DEST even
+            // when this submission has no upload runs or scatter pairs.
+            // A newly initialized hash still reads that buffer as an SRV.
             if let Some(was) = state
                 && hashed
-                && (!copy.runs.is_empty() || copy.pairs.1 > 0)
             {
                 last.push(transition(&shadow.buffer, was, read));
             }
