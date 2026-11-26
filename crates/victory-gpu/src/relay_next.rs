@@ -48,6 +48,30 @@ pub(crate) fn dependency_batches() -> bool {
     *ON.get_or_init(|| scheduler() && std::env::var_os("VICTORY_RELAY_NEXT_DEPENDENCY_BATCHES").is_some_and(|v| v == "1"))
 }
 
+/// R9c permits adjacent ready work from different title queues in one
+/// ordered ticket. It never bypasses an unresolved wait or signal.
+pub(crate) fn cross_queue_batches() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| dependency_batches() && std::env::var_os("VICTORY_RELAY_NEXT_CROSS_QUEUE").is_some_and(|v| v == "1"))
+}
+
+// Candidate selection counters, not just the relatively rare attempts at
+// the range-admission check. Report even when no candidate is admitted.
+static LANE_COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+pub(crate) fn lane_candidate(reason: usize) {
+    LANE_COUNTS[reason.min(5)].fetch_add(1, Ordering::Relaxed);
+}
+fn lane_report(calls: u64) {
+    tracing::info!(calls,
+        empty = LANE_COUNTS[0].load(Ordering::Relaxed),
+        earlier = LANE_COUNTS[1].load(Ordering::Relaxed),
+        candidate = LANE_COUNTS[2].load(Ordering::Relaxed),
+        boundary = LANE_COUNTS[3].load(Ordering::Relaxed),
+        cross_joined = LANE_COUNTS[4].load(Ordering::Relaxed),
+        satisfied_wait = LANE_COUNTS[5].load(Ordering::Relaxed),
+        "Relay Next R9c cross-queue scheduler statistics");
+}
+
 /// A final compare batch may follow the title parts: seven parts means
 /// at most eight GPU batches, all with their original queue boundaries.
 pub(crate) fn scheduler_parts() -> usize {
@@ -83,6 +107,7 @@ pub(crate) fn scheduler_stats(parts: usize, lists: usize, elapsed_us: u64) {
     if calls == 1 || calls.is_multiple_of(256) || trace() {
         tracing::info!(calls, parts, lists, elapsed_us, joined = JOINED.load(Ordering::Relaxed),
             "Relay Next R9a independent scheduler statistics");
+        if cross_queue_batches() { lane_report(calls); }
     }
 }
 

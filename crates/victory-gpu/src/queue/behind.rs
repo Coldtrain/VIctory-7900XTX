@@ -99,7 +99,7 @@ struct State<W> {
     next: u64,
     /// The queue whose entry is being done now (it is no longer in `items`;
     /// what that queue is given stays behind it all the same).
-    running: Option<usize>,
+    running: Vec<usize>,
     /// Times a look at the line was asked for, and the last of them that a
     /// whole look has followed.
     asked: u64,
@@ -124,7 +124,7 @@ impl<W: Work> Lane<W> {
             state: Mutex::new(State {
                 items: VecDeque::new(),
                 next: 0,
-                running: None,
+                running: Vec::new(),
                 asked: 0,
                 served: 0,
                 presents: 0,
@@ -163,7 +163,7 @@ impl<W: Work> Lane<W> {
     /// in between.
     pub(super) fn push_behind(&self, queue: usize, always: bool, what: W, now: impl FnOnce()) {
         let mut state = self.lock();
-        if always || state.running == Some(queue) || state.items.iter().any(|e| e.queue == queue) {
+        if always || state.running.contains(&queue) || state.items.iter().any(|e| e.queue == queue) {
             Self::put(&mut state, queue, what);
         } else {
             now();
@@ -191,7 +191,7 @@ impl<W: Work> Lane<W> {
             self.lock().items.iter().filter(|e| e.what.folded()).filter_map(|e| e.what.ask()).collect();
         folded.iter().for_each(W::settle);
         let mut state = self.lock();
-        if state.items.is_empty() && state.running.is_none() {
+        if state.items.is_empty() && state.running.is_empty() {
             return;
         }
         state.asked += 1;
@@ -313,7 +313,8 @@ impl<W: Work> Lane<W> {
             let Some(entry) = state.items.remove(at) else {
                 return false;
             };
-            state.running = Some(entry.queue);
+            state.running.clear();
+            state.running.push(entry.queue);
             entry
         };
         let (shows, mut runs) = (entry.what.shows(), usize::from(entry.what.runs()));
@@ -322,7 +323,7 @@ impl<W: Work> Lane<W> {
             // everything after it (they share its number; the first of them
             // is found first).
             let mut state = self.lock();
-            state.running = None;
+            state.running.clear();
             let at = state.items.iter().position(|e| e.number > entry.number).unwrap_or(state.items.len());
             Self::unfold(&mut state, at, entry);
             drop(state);
@@ -334,11 +335,40 @@ impl<W: Work> Lane<W> {
         while runs > 0 && !forced {
             let next = {
                 let mut state = self.lock();
-                let at = if crate::relay_next::scheduler() {
-                    // R9a must not join across another queue's entry.
+                let cross = crate::relay_next::cross_queue_batches();
+                let at = if cross {
+                    // Never jump over older blocked work, or beyond the
+                    // current drain horizon. The first entry is also the
+                    // head of its own queue.
+                    match state.items.front() {
+                        Some(e) if e.number >= entry.number && e.number < limit => {
+                            crate::relay_next::lane_candidate(2);
+                            Some(0)
+                        }
+                        Some(e) if e.number < entry.number => {
+                            crate::relay_next::lane_candidate(1);
+                            None
+                        }
+                        _ => {
+                            crate::relay_next::lane_candidate(0);
+                            None
+                        }
+                    }
+                } else if crate::relay_next::scheduler() {
                     state.items.front().filter(|e| e.queue == entry.queue && e.number < limit).map(|_| 0)
                 } else { state.items.iter().position(|e| e.queue == entry.queue && e.number < limit) };
-                at.and_then(|at| Some((at, state.items.remove(at)?)))
+                at.and_then(|at| {
+                    let next = state.items.remove(at)?;
+                    // Reserve this queue before dropping the lock. A
+                    // concurrent signal cannot bypass the removed entry,
+                    // including while admission is being evaluated.
+                    // On rejection we conservatively retain the reservation
+                    // until the current group finishes.
+                    if cross && !state.running.contains(&next.queue) {
+                        state.running.push(next.queue);
+                    }
+                    Some((at, next))
+                })
             };
             let Some((at, next)) = next else {
                 break;
@@ -356,7 +386,12 @@ impl<W: Work> Lane<W> {
             }
             let Entry { number, queue, what } = next;
             match entry.what.take_along(what) {
-                Ok(run) => runs += usize::from(run),
+                Ok(run) => {
+                    runs += usize::from(run);
+                    if run && queue != entry.queue && crate::relay_next::cross_queue_batches() {
+                        crate::relay_next::lane_candidate(4);
+                    }
+                }
                 Err(what) => {
                     self.lock().items.insert(at, Entry { number, queue, what });
                     break;
@@ -366,7 +401,7 @@ impl<W: Work> Lane<W> {
         entry.what.go(forced);
         {
             let mut state = self.lock();
-            state.running = None;
+            state.running.clear();
             state.presents -= usize::from(shows);
             state.runs -= runs;
         }
@@ -474,8 +509,18 @@ impl Work for Job {
         };
         let hosts = || lists.1.iter().map(|&i| lists.0[i].host());
         if crate::relay_next::scheduler() && !matches!(&next, Job::Run(..)) {
-            // Never move a CPU-visible signal or a value wait behind
-            // subsequent GPU work on the new scheduler.
+            // An already satisfied fence wait has no GPU or CPU operation
+            // to perform. Never absorb a signal, memory-value wait, present
+            // or a fence that would only be satisfied by work in this group.
+            if crate::relay_next::cross_queue_batches()
+                && matches!(&next, Job::Wait(f, v) if crate::fence::completed(*f as This) >= *v)
+            {
+                crate::relay_next::lane_candidate(5);
+                return Ok(false);
+            }
+            if crate::relay_next::cross_queue_batches() {
+                crate::relay_next::lane_candidate(3);
+            }
             return Err(next);
         }
         match &next {
@@ -1059,7 +1104,7 @@ mod tests {
         assert_eq!(value(f), 0);
         assert!(log.lock().unwrap().is_empty());
         // A fence behind a submission being done (no longer in the line).
-        while lane.lock().running.is_none() {
+        while lane.lock().running.is_empty() {
             std::thread::yield_now();
         }
         lane.push(1, [T::Run("second", log.clone())]);

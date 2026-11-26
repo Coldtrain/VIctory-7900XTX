@@ -25,6 +25,7 @@ $settings = @{
     VICTORY_RELAY_NEXT_QUEUE_DEPTH = '8'
     VICTORY_RELAY_NEXT_JOIN_PARTS = '7'
     VICTORY_RELAY_NEXT_DEPENDENCY_BATCHES = '1'
+    VICTORY_RELAY_NEXT_CROSS_QUEUE = '1'
     VICTORY_RELAY_NEXT_MERGE_WORKERS = '4'
     VICTORY_RELAY_NEXT_TRACE = '0'
     VICTORY_ASYNC_SUBMIT = '1'
@@ -33,8 +34,8 @@ $settings = @{
     VICTORY_CARD_STEPS = '0'
     VICTORY_TEXTURE_NO_WAIT = '0'
     VICTORY_D3D12_DRED = 'light'
-    VICTORY_D3D12_DEBUG = '1'
-    VICTORY_LOG = 'warn,victory_gpu::host=info,victory_gpu::relay_next=info'
+    VICTORY_D3D12_DEBUG = '0'
+    VICTORY_LOG = 'warn,victory_gpu::host=info,victory_gpu::relay_next=info,victory_gpu::queue::behind=info'
     VICTORY_AMBIENT = '0.8'
     VICTORY_SHOW_AFTER = '1'
     VICTORY_SKIP_PIPELINES = 'none'
@@ -60,7 +61,11 @@ try {
         $before[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
         [Environment]::SetEnvironmentVariable($name, $settings[$name], 'Process')
     }
-    & $victory run $game --execute
+    Start-Process -FilePath $victory `
+        -ArgumentList "run `"$game`" --execute" `
+        -NoNewWindow -Wait `
+        -RedirectStandardOutput "$root\victory.log" `
+        -RedirectStandardError "$root\victory-errors.log"
 } finally {
     foreach ($name in $before.Keys) {
         [Environment]::SetEnvironmentVariable($name, $before[$name], 'Process')
