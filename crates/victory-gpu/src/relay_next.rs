@@ -133,6 +133,36 @@ pub(crate) fn sparse_hash_stats(old: u64, new: u64, pieces: u64) {
     }
 }
 
+/// R11: index successful write-watch queries, without changing which
+/// ranges count as covered or the journal's publication epoch.
+pub(crate) fn indexed_refresh() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| paired() && std::env::var_os("VICTORY_RELAY_NEXT_INDEXED_REFRESH").is_some_and(|v| v == "1"))
+}
+
+/// Claim several refresh tasks per shared atomic operation. Keep small
+/// batches and the old path unchanged.
+pub(crate) fn refresh_chunk() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| if indexed_refresh() {
+        std::env::var("VICTORY_RELAY_NEXT_REFRESH_CHUNK").ok()
+            .and_then(|v| v.parse::<usize>().ok()).unwrap_or(8).clamp(1, 32)
+    } else { 1 })
+}
+
+pub(crate) fn refresh_index_stats(before: usize, after: usize) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static RANGES: AtomicU64 = AtomicU64::new(0);
+    static INDEXED: AtomicU64 = AtomicU64::new(0);
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    let ranges = RANGES.fetch_add(before as u64, Ordering::Relaxed) + before as u64;
+    let indexed = INDEXED.fetch_add(after as u64, Ordering::Relaxed) + after as u64;
+    if calls == 1 || calls.is_multiple_of(256) || trace() {
+        tracing::info!(calls, ranges, indexed, redundant_ranges = ranges.saturating_sub(indexed),
+            chunk = refresh_chunk(), "Relay Next R11 indexed refresh statistics");
+    }
+}
+
 pub(crate) fn snapshots() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| paired() && std::env::var_os("VICTORY_RELAY_NEXT_SNAPSHOTS").is_none_or(|v| v != "0"))

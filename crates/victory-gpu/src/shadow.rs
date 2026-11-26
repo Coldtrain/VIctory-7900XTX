@@ -1701,16 +1701,21 @@ pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) 
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let work = Arc::new(work);
     let threads = (wide_threads() + 1).min(n);
+    // Big batches of small refreshes contend on the shared counter.
+    // Small batches retain the original single-item scheduling.
+    let chunk = if n >= 256 { crate::relay_next::refresh_chunk() } else { 1 };
     let jobs = (0..threads)
         .map(|_| {
             let (next, work) = (next.clone(), work.clone());
             Box::new(move || {
                 loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let i = next.fetch_add(chunk, Ordering::Relaxed);
                     if i >= n {
                         break;
                     }
-                    work(i);
+                    for item in i..i.saturating_add(chunk).min(n) {
+                        work(item);
+                    }
                 }
             }) as Job
         })

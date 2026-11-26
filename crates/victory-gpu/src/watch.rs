@@ -118,6 +118,53 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     })
 }
 
+/// Keep precisely the original single-range containment predicate.
+/// Sorting by start and discarding contained intervals gives strictly
+/// increasing starts and ends. Do not merge touching or partially
+/// overlapping ranges: a query spanning two ranges was not covered before.
+fn index_ahead(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    let mut end = None;
+    ranges.retain(|&(_, b)| {
+        if end.is_some_and(|previous| previous >= b) { return false; }
+        end = Some(b);
+        true
+    });
+    ranges
+}
+
+fn indexed_contains(ranges: &[(usize, usize)], first: usize, last: usize) -> bool {
+    let i = ranges.partition_point(|&(a, _)| a <= first);
+    i.checked_sub(1).is_some_and(|i| ranges[i].1 >= last)
+}
+
+fn publish_ahead(ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    if !crate::relay_next::indexed_refresh() { return ranges; }
+    let before = ranges.len();
+    let ranges = index_ahead(ranges);
+    crate::relay_next::refresh_index_stats(before, ranges.len());
+    ranges
+}
+
+#[cfg(test)]
+mod indexed_refresh_tests {
+    use super::*;
+    #[test]
+    fn containment_is_identical_to_linear_query() {
+        let ranges = vec![(9, 15), (1, 4), (3, 8), (1, 2), (9, 11), (16, 20), (1, 4)];
+        let indexed = index_ahead(ranges.clone());
+        assert_eq!(indexed, vec![(1, 4), (3, 8), (9, 15), (16, 20)]);
+        for a in 0..=22 {
+            for b in a..=22 {
+                assert_eq!(indexed_contains(&indexed, a, b), ranges.iter().any(|&(x, y)| x <= a && b <= y));
+            }
+        }
+        assert!(!indexed_contains(&indexed, 2, 7));
+        assert!(!indexed_contains(&index_ahead(vec![(1, 3), (3, 5)]), 2, 4));
+        assert!(!indexed_contains(&[], 0, 1));
+    }
+}
+
 struct Journal {
     /// Page number → the asking that last found it written.
     written: BTreeMap<usize, u64>,
@@ -149,6 +196,16 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     ahead_asked: 0,
     kept: false,
 });
+
+impl Journal {
+    fn ahead_contains(&self, first: usize, last: usize) -> bool {
+        if crate::relay_next::indexed_refresh() {
+            indexed_contains(&self.ahead, first, last)
+        } else {
+            self.ahead.iter().any(|&(a, b)| a <= first && last <= b)
+        }
+    }
+}
 
 fn journal() -> std::sync::RwLockReadGuard<'static, Journal> {
     if let Ok(j) = JOURNAL.try_read() {
@@ -347,6 +404,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         i = k;
     }
     note_hot(&written);
+    let asked = publish_ahead(asked);
     let mut j = journal_mut();
     j.ahead_asked = next_asking();
     j.ahead = asked;
@@ -563,6 +621,7 @@ fn ask_rest(ranges: &[(usize, usize)]) {
         }
     }
     note_hot(&written);
+    let ahead = publish_ahead(ahead);
     let mut j = journal_mut();
     // A number of its own, and the one this asking stands under: between
     // the two parts another thread may have asked about a range of the
@@ -647,9 +706,7 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
+    j.ahead_contains(first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -662,7 +719,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
     // Asked ahead with the submission's other ranges: the journal has it.
-    let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, of(j)));
+    let ahead = |j: &Journal| j.ahead_contains(first, last).then(|| (j.ahead_asked, of(j)));
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
@@ -746,7 +803,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
     let j = journal();
-    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if !known && !j.ahead_contains(first, last) {
         return false;
     }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
