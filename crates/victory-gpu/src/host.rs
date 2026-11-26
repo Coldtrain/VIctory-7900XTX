@@ -2621,6 +2621,28 @@ struct CardRange {
 }
 
 impl CardPlan {
+    /// Combine adjacent input pieces only when their output flags are
+    /// adjacent too. The CPU still lands every declared byte range separately.
+    fn compare_runs(&self) -> impl Iterator<Item = (&CardRange, crate::shadow::CardSpan)> {
+        let mut ranges = self.ranges.iter().filter(|r| r.compared).peekable();
+        let batch = crate::relay_next::scheduler();
+        std::iter::from_fn(move || {
+            let first = ranges.next()?;
+            let mut span = first.span;
+            while batch && let Some(&next) = ranges.peek() {
+                if !std::sync::Arc::ptr_eq(&first.shadow, &next.shadow)
+                    || first.picked != next.picked || span.skew != next.span.skew
+                    || span.first.checked_add(span.pieces) != Some(next.span.first)
+                    || first.at.checked_add(span.pieces) != Some(next.at)
+                { break; }
+                span.pieces += next.span.pieces;
+                span.to = next.span.to;
+                ranges.next();
+            }
+            Some((first, span))
+        })
+    }
+
     /// `crate::picked` is told where what it looked at changed, by the
     /// compare's results.
     fn picked_found(&self, differs: &[u32]) {
@@ -5516,7 +5538,7 @@ impl Host {
                     list.SetPipelineState(&work.pso);
                     let results = plan.next_snapshot.as_ref().map_or(&work.differs, |s| &s.differs);
                     list.SetComputeRootUnorderedAccessView(3, results.0.GetGPUVirtualAddress());
-                    for r in plan.ranges.iter().filter(|r| r.compared) {
+                    for (r, span) in plan.compare_runs() {
                         let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
                             continue;
                         };
@@ -5527,7 +5549,7 @@ impl Host {
                         let mode = if flown && !r.picked { 2 }
                             else if !flown && !r.picked && plan.next_snapshot.as_ref().is_some_and(|s| s.packed) { 3 }
                             else { 1 };
-                        card_pass(list, &r.span, size as u32, r.at, mode);
+                        card_pass(list, &span, size as u32, r.at, mode);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
@@ -5543,9 +5565,9 @@ impl Host {
     /// accesses a mapped buffer, or submits to a GPU queue.
     fn start_card_compare(work: &CardWork, plan: &CardPlan, check: &Prelude) -> Option<PreludeDone> {
         let packed = plan.next_snapshot.as_ref().is_some_and(|s| s.packed);
-        let dispatches: Vec<_> = plan.ranges.iter().filter(|r| r.compared).filter_map(|r| {
+        let dispatches: Vec<_> = plan.compare_runs().filter_map(|(r, span)| {
             let (_, before, _) = r.shadow.card_sides()?;
-            Some((r.shadow.buffer.clone(), before?, r.span, r.shadow.card_hash_size() as u32,
+            Some((r.shadow.buffer.clone(), before?, span, r.shadow.card_hash_size() as u32,
                 r.at, if !r.picked && packed { 3 } else { 1 }))
         }).collect();
         if dispatches.is_empty() { return None; }
