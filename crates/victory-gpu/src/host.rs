@@ -1377,6 +1377,59 @@ pub(crate) struct HostList {
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 
+/// R13b: workers only record already planned transitions into privately
+/// owned prelude allocators. They never update global resource states.
+type PreludeJob = Box<dyn FnOnce() + Send>;
+type PreludeDone = std::sync::mpsc::Receiver<()>;
+
+fn next_prelude_workers() -> &'static [std::sync::mpsc::SyncSender<PreludeJob>] {
+    static POOL: OnceLock<Vec<std::sync::mpsc::SyncSender<PreludeJob>>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let count = std::env::var("VICTORY_RELAY_NEXT_PREP_WORKERS").ok()
+            .and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).min(8);
+        let mut pool = Vec::new();
+        for i in 0..count {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<PreludeJob>(2);
+            if std::thread::Builder::new().name(format!("victory-prelude-{i}")).spawn(move || {
+                crate::cores::keep_helper_on_fast_cores("victory-prelude");
+                while let Ok(job) = rx.recv() { job(); }
+            }).is_ok() {
+                pool.push(tx);
+            }
+        }
+        tracing::info!(workers = pool.len(), "Relay Next R13b prelude recording pool");
+        pool
+    })
+}
+
+fn next_prelude_stat(kind: usize, amount: u64) {
+    static COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    let count = COUNTS[kind].fetch_add(amount, Ordering::Relaxed) + amount;
+    if kind == 0 && (count == 1 || count.is_multiple_of(256)) {
+        tracing::info!(queued = count, completed = COUNTS[1].load(Ordering::Relaxed),
+            inline_fallback = COUNTS[2].load(Ordering::Relaxed),
+            join_us = COUNTS[3].load(Ordering::Relaxed),
+            "Relay Next R13b parallel prelude statistics");
+    }
+}
+
+fn next_record_prelude(mut job: PreludeJob) {
+    use std::sync::mpsc::TrySendError;
+    static TURN: AtomicU64 = AtomicU64::new(0);
+    let pool = next_prelude_workers();
+    if !pool.is_empty() {
+        let start = (TURN.fetch_add(1, Ordering::Relaxed) as usize) % pool.len();
+        for i in 0..pool.len() {
+            match pool[(start + i) % pool.len()].try_send(job) {
+                Ok(()) => { next_prelude_stat(0, 1); return; }
+                Err(TrySendError::Full(back) | TrySendError::Disconnected(back)) => job = back,
+            }
+        }
+    }
+    next_prelude_stat(2, 1);
+    job();
+}
+
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
 /// it; lists that name no texture never have one, and every host list was
@@ -6636,11 +6689,20 @@ impl Host {
         }
         stage.next("submit: the lists' steps");
         prep_checkpoint(&self.device, "submit: the lists' steps");
+        // A title may submit the same recording twice. Do not let two
+        // recording jobs reset the same prelude allocator in parallel.
+        let parallel_preludes = crate::relay_next::enabled()
+            && !next_prelude_workers().is_empty()
+            && {
+                let mut unique = std::collections::HashSet::new();
+                runs.iter().all(|list| unique.insert(list.list.as_raw() as usize))
+            };
+        let mut prelude_done: Vec<PreludeDone> = Vec::new();
         for list in runs {
             prep_trace(|| format!("deferred begin submission={this_submission} list={:#x}", list.list.as_raw() as usize));
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            if let Some(prelude) = list.prelude(parallel_preludes.then_some(&mut prelude_done)) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
@@ -6702,6 +6764,17 @@ impl Host {
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
+        // Join only at the real execution boundary. All ordered state
+        // planning, refreshes and snapshot work above can overlap recording.
+        if !prelude_done.is_empty() {
+            let started = std::time::Instant::now();
+            for done in prelude_done {
+                if done.recv().is_err() {
+                    fail(format_args!("Relay Next R13b prelude worker failed"));
+                }
+            }
+            next_prelude_stat(3, started.elapsed().as_micros() as u64);
+        }
         #[cfg(feature = "diagnostics")]
         split.part(15);
         let prepared = std::time::Instant::now();
@@ -7868,7 +7941,7 @@ impl HostList {
     /// states become those the list ends with. For depth textures with a
     /// colour twin it first copies the side the list uses as it finds it
     /// from the other, if a list submitted earlier left it behind.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    fn prelude(&self, parallel: Option<&mut Vec<PreludeDone>>) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -7891,6 +7964,47 @@ impl HostList {
             u.twin.behind.store(left, Ordering::Relaxed);
         }
         drop(twins);
+        // Pure state transitions can be recorded independently once the
+        // submission lane has resolved their ordered before/after states.
+        // Twin copies stay on the existing serial path.
+        if syncs.is_empty() {
+            if let Some(done) = parallel {
+                let transitions: Vec<_> = states.values().filter_map(|(first, last, copy)| {
+                    let real = copy.state.swap(*last, Ordering::Relaxed);
+                    (real != *first).then(|| (copy.texture.clone(), host_state(real), host_state(*first)))
+                }).collect();
+                if transitions.is_empty() { return None; }
+                let Some((allocator, list)) = self.prelude
+                    .get_or_init(|| host().and_then(|h| h.make_prelude())).as_ref()
+                else { fail(format_args!("no host list for a state prelude")); };
+                let result = list.cast().ok();
+                let allocator = allocator.clone();
+                let list = list.clone();
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                // The COM clones keep resources alive while the private
+                // allocator is reset and the command list is recorded.
+                next_record_prelude(Box::new(move || {
+                    let barriers: Vec<_> = transitions.iter()
+                        .map(|(resource, before, after)| transition(resource, *before, *after)).collect();
+                    // SAFETY: the owning ticket has not been sent yet;
+                    // the recording lease protects this unique allocator.
+                    let recorded = unsafe {
+                        allocator.Reset().and_then(|()| {
+                            list.Reset(&allocator, None)?;
+                            list.ResourceBarrier(&barriers);
+                            list.Close()
+                        })
+                    };
+                    if let Err(e) = recorded {
+                        fail(format_args!("Relay Next R13b prelude recording failed ({e})"));
+                    }
+                    next_prelude_stat(1, 1);
+                    let _ = tx.send(());
+                }));
+                done.push(rx);
+                return result;
+            }
+        }
         // A copy runs with its textures in the copy states: each moves
         // there from its real state, and from there to the state the list
         // starts with (back to its real state if the list does not use it).
