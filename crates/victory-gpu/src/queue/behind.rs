@@ -334,7 +334,10 @@ impl<W: Work> Lane<W> {
         while runs > 0 && !forced {
             let next = {
                 let mut state = self.lock();
-                let at = state.items.iter().position(|e| e.queue == entry.queue && e.number < limit);
+                let at = if crate::relay_next::scheduler() {
+                    // R9a must not join across another queue's entry.
+                    state.items.front().filter(|e| e.queue == entry.queue && e.number < limit).map(|_| 0)
+                } else { state.items.iter().position(|e| e.queue == entry.queue && e.number < limit) };
                 at.and_then(|at| Some((at, state.items.remove(at)?)))
             };
             let Some((at, next)) = next else {
@@ -470,6 +473,11 @@ impl Work for Job {
             _ => return Err(next),
         };
         let hosts = || lists.1.iter().map(|&i| lists.0[i].host());
+        if crate::relay_next::scheduler() && !matches!(&next, Job::Run(..)) {
+            // Never move a CPU-visible signal or a value wait behind
+            // subsequent GPU work on the new scheduler.
+            return Err(next);
+        }
         match &next {
             Job::Value(wait) => {
                 let met = wait.met()
@@ -487,9 +495,13 @@ impl Work for Job {
             Job::Signal(..) => {}
             Job::Run(_, more, order) => {
                 let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| more[i].host()).collect();
-                if count >= most || lists.1.len() + runs.len() > most_lists || !crate::host::joinable(hosts(), &runs) {
+                if count >= most || lists.1.len() + runs.len() > most_lists {
                     return Err(next);
                 }
+                let safe = if crate::relay_next::scheduler() {
+                    crate::host::next_joinable(hosts(), &runs)
+                } else { crate::host::joinable(hosts(), &runs) };
+                if !safe { return Err(next); }
             }
             Job::Joined(..) | Job::Present(..) | Job::Lists(..) => return Err(next),
         }
@@ -612,7 +624,9 @@ const JOINED: usize = 10;
 /// (`VICTORY_SUBMIT_DEPTH`; 64: about two frames of the title's).
 fn runs_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| number("VICTORY_SUBMIT_DEPTH").unwrap_or(64).max(1))
+    *MOST.get_or_init(|| if crate::relay_next::scheduler() {
+        crate::relay_next::scheduler_depth()
+    } else { number("VICTORY_SUBMIT_DEPTH").unwrap_or(64).max(1) })
 }
 
 /// How many presents may be in the line when a present call returns
@@ -620,7 +634,10 @@ fn runs_most() -> usize {
 /// 0: both are).
 fn frames_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| number("VICTORY_SUBMIT_FRAMES").unwrap_or(1))
+    *MOST.get_or_init(|| if crate::relay_next::scheduler() {
+        // First sprint does not queue presents across frames.
+        0
+    } else { number("VICTORY_SUBMIT_FRAMES").unwrap_or(1) })
 }
 
 fn number(name: &str) -> Option<usize> {
@@ -659,8 +676,8 @@ pub(super) fn leave() {
 fn started() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        if !crate::host::late_free_present() || !super::cuts() {
-            tracing::warn!("VICTORY_ASYNC_SUBMIT=1 needs the relay and lists cut at their waits: submissions are prepared by the thread that makes them");
+        if (!crate::host::late_free_present() && !crate::relay_next::scheduler()) || !super::cuts() {
+            tracing::warn!("VICTORY_ASYNC_SUBMIT=1 needs a compatible relay or Relay Next scheduler and lists cut at their waits");
             return false;
         }
         let worker = || {
@@ -681,6 +698,7 @@ fn started() -> bool {
                 tracing::info!(
                     frames = frames_most(),
                     runs = runs_most(),
+                    relay_next = crate::relay_next::scheduler(),
                     "submissions are prepared and sent by a thread of ours, not by the thread that submits (VICTORY_ASYNC_SUBMIT=1)"
                 );
                 true

@@ -3352,7 +3352,22 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
 /// front of the first ([`refresh_front`], without which a later part's title
 /// bytes under an earlier part's declared writes would go missing).
 pub(crate) fn joins() -> (usize, usize) {
-    if ahead_of_writes() { joins_asked() } else { (1, 1) }
+    if crate::relay_next::scheduler() { (crate::relay_next::scheduler_parts(), 48) }
+    else if ahead_of_writes() { joins_asked() } else { (1, 1) }
+}
+
+/// R9a deliberately joins only recordings with no submission-time title
+/// memory operations, shader-write declarations or readbacks. This avoids
+/// reusing a CPU staging buffer while an earlier part reads it. Do not
+/// cross a wait, signal or present (enforced by the queue lane).
+pub(crate) fn next_joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&HostList]) -> bool {
+    if crate::picked::on() || upcheck::on() || next.is_empty() { return false; }
+    ahead.chain(next.iter().copied()).all(|list| {
+        let d = list.deferred();
+        d.copies.is_empty() && d.writes.is_empty() && d.backs.is_empty()
+            && d.back_wanted.is_empty() && d.texture_backs.is_empty()
+            && d.gpu_written.is_empty()
+    })
 }
 
 fn joins_asked() -> (usize, usize) {
@@ -5607,6 +5622,18 @@ impl Host {
             crate::list::recycle(lists, &order);
             return;
         }
+        if crate::relay_next::scheduler() {
+            let began = std::time::Instant::now();
+            {
+                let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
+                // Keep the stable synchronous landing path and its ticket
+                // ownership. Only the submitting title thread runs ahead.
+                let _ = self.submit(&runs, parts, false);
+            }
+            crate::relay_next::scheduler_stats(parts.len() + 1, order.len(), began.elapsed().as_micros() as u64);
+            crate::list::recycle(lists, &order);
+            return;
+        }
         late_threads();
         if let Some(cut) = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
@@ -6257,7 +6284,23 @@ impl Host {
         } else { None };
         #[cfg(feature = "diagnostics")]
         let compare_cut = if timing() { None } else { compare_cut };
-        let paired_batches = compare_cut.is_some();
+        let joined = crate::relay_next::scheduler() && !parts.is_empty();
+        let joined_groups = || {
+            // Preserve every original title submission boundary (D3D12
+            // resource state decay occurs at ExecuteCommandLists).
+            let mut cuts: Vec<usize> = parts.iter().filter_map(|&p| firsts.get(p).copied()).collect();
+            if let Some(cut) = compare_cut { cuts.push(cut); }
+            cuts.retain(|&p| p > 0 && p < lists.len());
+            cuts.sort_unstable();
+            cuts.dedup();
+            let mut from = 0;
+            cuts.into_iter().chain([lists.len()]).map(|to| {
+                let group = &lists[from..to];
+                from = to;
+                group
+            }).collect::<Vec<_>>()
+        };
+        let paired_batches = compare_cut.is_some() || joined;
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
         let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
@@ -6266,13 +6309,17 @@ impl Host {
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
                 .map(|(&a, &b)| &lists[a..b])
                 .collect()
+        } else if joined {
+            joined_groups()
         } else if let Some(cut) = compare_cut {
             vec![&lists[..cut], &lists[cut..]]
         } else {
             vec![&lists[..]]
         };
         #[cfg(not(feature = "diagnostics"))]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if let Some(cut) = compare_cut {
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if joined {
+            joined_groups()
+        } else if let Some(cut) = compare_cut {
             vec![&lists[..cut], &lists[cut..]]
         } else {
             vec![&lists[..]]
@@ -6303,7 +6350,7 @@ impl Host {
                 if crate::relay_next::paired() && next_descriptor_horizon.is_none() {
                     next_descriptor_horizon = Some(DESCRIPTOR_HORIZON.lock().unwrap_or_else(|e| e.into_inner()));
                 }
-                ticket.send(&self.device, &self.queue, &self.fence, *submitted, group, paired_batches, || self.card_sent());
+                ticket.send(&self.device, &self.queue, &self.fence, *submitted, group, paired_batches, groups.len(), || self.card_sent());
                 if let Some(horizon) = next_descriptor_horizon.as_mut() {
                     **horizon = *submitted;
                 }

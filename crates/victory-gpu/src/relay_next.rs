@@ -26,6 +26,41 @@ pub(crate) fn enabled() -> bool { mode() != 0 }
 /// Independent title submissions still complete in order.
 pub(crate) fn paired() -> bool { mode() == 2 }
 
+/// R9a uses the existing ordered queue lane without enabling legacy Relay.
+/// The lane owns detached recordings; each ticket still lands in order.
+pub(crate) fn scheduler() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| paired()
+        && std::env::var_os("VICTORY_RELAY_NEXT_SCHEDULER").is_some_and(|v| v == "1")
+        && std::env::var_os("VICTORY_GPU_TIMING").is_none())
+}
+
+/// Bound how much work is queued ahead of the GPU owner.
+pub(crate) fn scheduler_depth() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_RELAY_NEXT_QUEUE_DEPTH").ok()
+        .and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).clamp(1, 8))
+}
+
+/// Number of strictly side-effect-free title submissions that may be
+/// combined, preserving their ExecuteCommandLists boundaries.
+pub(crate) fn scheduler_parts() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_RELAY_NEXT_JOIN_PARTS").ok()
+        .and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).clamp(1, 4))
+}
+
+pub(crate) fn scheduler_stats(parts: usize, lists: usize, elapsed_us: u64) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static JOINED: AtomicU64 = AtomicU64::new(0);
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    JOINED.fetch_add(parts.saturating_sub(1) as u64, Ordering::Relaxed);
+    if calls == 1 || calls.is_multiple_of(256) || trace() {
+        tracing::info!(calls, parts, lists, elapsed_us, joined = JOINED.load(Ordering::Relaxed),
+            "Relay Next R9a independent scheduler statistics");
+    }
+}
+
 pub(crate) fn snapshots() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| paired() && std::env::var_os("VICTORY_RELAY_NEXT_SNAPSHOTS").is_none_or(|v| v != "0"))
@@ -208,7 +243,11 @@ impl Progress {
     }
 
     fn enqueue(&mut self, fence: u64, limit: usize) -> bool {
-        if fence == 0 || fence == u64::MAX || self.pending >= limit.min(2) || !match self.phase {
+        self.enqueue_bounded(fence, limit.min(2))
+    }
+
+    fn enqueue_bounded(&mut self, fence: u64, limit: usize) -> bool {
+        if fence == 0 || fence == u64::MAX || self.pending >= limit.min(5) || !match self.phase {
             Phase::Preparing => true,
             Phase::GpuComplete(last) | Phase::InFlight(last) => fence > last,
             Phase::CpuVisible => false,
@@ -278,7 +317,8 @@ impl Ticket {
     pub(crate) fn new(number: u64) -> Self {
         static START: std::sync::Once = std::sync::Once::new();
         START.call_once(|| tracing::info!(
-            mode = mode(), max_batches = if paired() { 2 } else { 1 }, max_title_tickets = 1, copy_queue = false,
+            mode = mode(), max_batches = if scheduler() { scheduler_parts().max(2) + usize::from(scheduler_parts() >= 2) } else if paired() { 2 } else { 1 }, max_title_tickets = 1, copy_queue = false,
+            independent_scheduler = scheduler(), queue_depth = scheduler_depth(),
             private_snapshots = snapshots(), parallel_landing = parallel_landing(), merge_workers = merge_workers(),
             resident_rehash = crate::host::next_resident_rehash(), resident_merge = resident_merge(),
             "Relay Next R6: resident merge results; legacy Relay disabled"
@@ -306,9 +346,11 @@ impl Ticket {
     pub(crate) fn send(
         &mut self, device: &ID3D12Device, queue: &ID3D12CommandQueue,
         fence: &ID3D12Fence, target: u64,
-        lists: &[Option<ID3D12CommandList>], overlap: bool, queued: impl FnOnce(),
+        lists: &[Option<ID3D12CommandList>], overlap: bool, batch_limit: usize, queued: impl FnOnce(),
     ) {
-        let accepted = if overlap && paired() { self.progress.enqueue(target, 2) } else { self.progress.sent(target) };
+        let accepted = if overlap && paired() && scheduler() && batch_limit > 2 {
+            self.progress.enqueue_bounded(target, batch_limit)
+        } else if overlap && paired() { self.progress.enqueue(target, 2) } else { self.progress.sent(target) };
         if !accepted {
             crate::host::fail(format_args!("Relay Next invalid submission transition: {} {:?}", self.number, self.progress));
         }
@@ -426,6 +468,18 @@ mod tests {
         assert!(!p.visible());
         assert!(p.completed(11));
         assert_eq!(p.pending, 0);
+        assert!(p.visible());
+    }
+
+    #[test]
+    fn scheduler_five_batches_need_final_fence_and_reject_sixth() {
+        let mut p = Progress::new();
+        for f in 11..=15 { assert!(p.enqueue_bounded(f, 5)); }
+        assert_eq!(p.peak, 5);
+        assert!(!p.enqueue_bounded(16, 6));
+        assert!(!p.completed(14));
+        assert!(!p.visible());
+        assert!(p.completed(15));
         assert!(p.visible());
     }
 
