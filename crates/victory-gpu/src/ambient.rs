@@ -469,7 +469,12 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
         l.SetComputeRoot32BitConstants(0, 12, words.as_ptr().cast(), 0);
-        l.SetComputeRootDescriptorTable(1, views.depth);
+        // Only Resolve uses depth (t0). Radiance and Air pass their UAV
+        // as the unused depth placeholder; binding that to the static SRV
+        // table violates the root signature (D3D12 message 646).
+        if role == Role::Resolve {
+            l.SetComputeRootDescriptorTable(1, views.depth);
+        }
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
