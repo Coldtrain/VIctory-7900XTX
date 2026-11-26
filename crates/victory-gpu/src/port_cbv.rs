@@ -38,12 +38,12 @@ pub(crate) fn on() -> bool {
 }
 
 /// Whether a table's constant buffer in title memory in place is given to the
-/// card where it is (on with the port; `VICTORY_PORT_CBV_PLACE=0`: copied as
-/// before, and read through the raw twin all the same). With
-/// `VICTORY_AB=<s>,VICTORY_PORT_CBV_PLACE` (diagnostics builds) on and off
-/// while the title runs: both sides measured in one run.
+/// card where it is (explicit `VICTORY_PORT_CBV_PLACE=1`, Relay 0 only).
+/// Otherwise copy as before, and read through the raw twin all the same.
 pub(crate) fn in_place_on() -> bool {
-    on() && crate::toggled!("VICTORY_PORT_CBV_PLACE")
+    // Validate raw shader/descriptor compatibility independently of title
+    // memory reuse. Zero-copy is an explicit experiment, not the default.
+    on() && std::env::var_os("VICTORY_PORT_CBV_PLACE").is_some_and(|v| v == "1") && !crate::host::late() && !crate::relay_next::enabled()
 }
 
 /// Since the last line: tables' constant buffers given in place, their bytes;

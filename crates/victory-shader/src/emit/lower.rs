@@ -6765,8 +6765,7 @@ impl<'a> Lower<'a> {
     ///   of its slot ([`super::shader::raw_views`]), which the host makes a
     ///   raw view of the same bytes; a twin's reads end where the view does,
     ///   as a constant buffer's do;
-    /// - a root one: as the root SRV `t<slot>` in [`super::shader::ROOT_CBV_SPACE`],
-    ///   which the host binds at the title's address like any root SRV.
+    /// - root CBVs retain their existing bounded constant-buffer binding.
     ///
     /// Anything else (a descriptor built otherwise, or chosen between kinds of
     /// parameter) stays a constant buffer.
@@ -6774,17 +6773,10 @@ impl<'a> Lower<'a> {
         if !super::shader::constants_raw() {
             return Ok(None);
         }
-        if let Source::Built { address, .. } = src {
-            if self.root_copy.is_some() {
-                return Ok(None);
-            }
-            let Some(&rp) = self.x.native.layout.get(address.param) else {
-                return Ok(None);
-            };
-            let kind = self.x.native.used.iter().find(|u| u.user_data == rp.user_data).map(|u| u.kind);
-            if rp.root == RootType::Descriptor && matches!(kind, Some(ResourceType::Cbv) | None) {
-                return Ok(Some(self.s.root_srv_handle(rp.slot)));
-            }
+        // Root CBVs have no explicit size. Keep their existing CBV binding:
+        // a root SRV is not equivalent, particularly with bounded SRV tables
+        // and the raw-view alignment/bias rules. Optimize heap views only.
+        if matches!(src, Source::Built { .. }) {
             return Ok(None);
         }
         if super::shader::raw_views() == 0 {
@@ -7355,6 +7347,11 @@ impl<'a> Lower<'a> {
         const RAW: u32 = 11;
         const CONSTANT: u32 = 13;
         let first = super::shader::raw_views();
+        // Port 5 changes CBV twins to raw SRVs. A conventional CBV load
+        // must select the original CBV, not annotate the raw twin as a CBV.
+        if super::shader::constants_raw() && props.0 & 0xFF == CONSTANT {
+            return (index, false);
+        }
         let picked = |leaf: &&Source| {
             let (Source::Loaded { load, .. } | Source::Fetched { load, .. }) = leaf else {
                 return false;

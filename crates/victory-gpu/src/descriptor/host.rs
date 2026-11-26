@@ -2898,8 +2898,11 @@ impl HostHeap {
         let Some(offset) = gpu.checked_sub(base).filter(|&o| o < width && crate::port_cbv::raw_ok(o)) else {
             return false;
         };
-        let bytes = u64::from(constant_bytes(size)).min(width - offset) & !3;
-        if bytes == 0 {
+        // The same slot can be consumed as a CBV by another shader.
+        // Preserve a real CBV and the full rounded span, otherwise take the
+        // existing scratch-copy path (which makes both descriptor types).
+        let bytes = u64::from(constant_bytes(size));
+        if bytes == 0 || !gpu.is_multiple_of(256) || bytes > width - offset {
             return false;
         }
         let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -2916,10 +2919,9 @@ impl HostHeap {
             },
         };
         let cbv = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-            BufferLocation: if gpu.is_multiple_of(256) { gpu } else { 0 },
-            SizeInBytes: if gpu.is_multiple_of(256) { constant_bytes(size).min(((width - offset) & !255) as u32) } else { 0 },
+            BufferLocation: gpu,
+            SizeInBytes: bytes as u32,
         };
-        let cbv = if cbv.SizeInBytes == 0 { D3D12_CONSTANT_BUFFER_VIEW_DESC::default() } else { cbv };
         // SAFETY: slots of our heaps; the ranges lie in the live buffer (a
         // zero location makes a null constant buffer view).
         unsafe {
@@ -3994,7 +3996,7 @@ fn constant_twinned(
     let cbv = if gpu.is_multiple_of(256) && room >= 256 {
         D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
-            SizeInBytes: constant_bytes(size).min((room & !255) as u32),
+            SizeInBytes: u64::from(constant_bytes(size)).min(room & !255) as u32,
         }
     } else {
         D3D12_CONSTANT_BUFFER_VIEW_DESC::default()
