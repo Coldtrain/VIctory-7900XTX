@@ -2605,6 +2605,16 @@ impl HostHeap {
 
     /// As [`HostHeap::copy_to`], from the slot `from`, which the card does not
     /// see.
+    // Dynamic root slots have recording-specific ownership. Title slots
+    // and their raw twins may be indexed by any outstanding shader.
+    fn publication(&self, to: u32, host: &crate::host::Host) -> Option<std::sync::MutexGuard<'static, u64>> {
+        if to < self.count || (self.raw != 0 && to >= self.raw && to - self.raw < self.count) {
+            crate::host::descriptor_publication(host)
+        } else {
+            None
+        }
+    }
+
     fn copy_from(&self, to: u32, from: D3D12_CPU_DESCRIPTOR_HANDLE) {
         #[cfg(feature = "diagnostics")]
         if let Some(written) = self.written.get(to as usize) {
@@ -2612,6 +2622,7 @@ impl HostHeap {
         }
         let Some(host) = host() else { return };
         // SAFETY: a slot of our heap, and one of this thread's heap.
+        let _publication = self.publication(to, host);
         unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
     }
 
@@ -2890,6 +2901,7 @@ impl HostHeap {
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
         };
         // SAFETY: a slot of our heap, and one of this thread's heap slots.
+        let _publication = self.publication(to, host);
         unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, kind) };
     }
 
