@@ -121,7 +121,11 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    host_shader_with_cbv(container).map(|(shader, _)| shader)
+}
+
+pub(crate) fn host_shader_with_cbv(container: &[u8]) -> Result<(HostShader, bool), String> {
+    let translate = |c: &[u8]| victory_shader::emit::translate_with_cbv_proof(c).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
@@ -135,18 +139,20 @@ struct Translate<F> {
     ran: AtomicBool,
 }
 
-impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
+impl<F: Fn(&[u8]) -> Result<(HostShader, bool), String> + Send + Sync> Converter for Translate<F> {
     fn id(&self) -> &'static str {
         "shader.dxil"
     }
     fn version(&self) -> u32 {
-        // The build fingerprint in the input does the versioning.
-        1
+        // v2 prefixes the encoded shader with its raw-only proof bit.
+        2
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
-        Ok(encode(&shader))
+        let (shader, raw_only) = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
+        let mut bytes = vec![u8::from(raw_only)];
+        bytes.extend(encode(&shader));
+        Ok(bytes)
     }
 }
 
@@ -154,8 +160,8 @@ fn cached(
     cache: &Cache,
     build: &[u8; 32],
     container: &[u8],
-    translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
-) -> Result<HostShader, String> {
+    translate: impl Fn(&[u8]) -> Result<(HostShader, bool), String> + Send + Sync,
+) -> Result<(HostShader, bool), String> {
     let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
@@ -165,7 +171,11 @@ fn cached(
         let path = cache
             .get_or_convert(&converter, &input)
             .map_err(|e| format!("{e:#}"))?;
-        if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
+        if let Some(shader) = std::fs::read(&path).ok().and_then(|b| {
+            let (&proof, rest) = b.split_first()?;
+            if proof > 1 { return None; }
+            Some((decode(rest)?, proof == 1))
+        }) {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
             } else {
@@ -397,27 +407,27 @@ mod tests {
         let runs = AtomicU64::new(0);
         let translate = |_: &[u8]| {
             runs.fetch_add(1, Ordering::Relaxed);
-            Ok(shader())
+            Ok((shader(), true))
         };
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &build, container, translate), Ok((shader(), true)));
+        assert_eq!(cached(&cache, &build, container, translate), Ok((shader(), true)));
         assert_eq!(runs.load(Ordering::Relaxed), 1, "the second came from disk");
 
         // Another build translates again.
-        assert_eq!(cached(&cache, &[8; 32], container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &[8; 32], container, translate), Ok((shader(), true)));
         assert_eq!(runs.load(Ordering::Relaxed), 2);
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
             std::fs::write(e, b"VSH1 broken").unwrap();
         }
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &build, container, translate), Ok((shader(), true)));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(cached(&cache, &build, container, translate), Ok((shader(), true)));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
 
         // Failures are not stored.
-        let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
+        let fail = |_: &[u8]| Err::<(HostShader, bool), _>("unsupported".to_owned());
         assert!(cached(&cache, &build, b"other", fail).is_err());
     }
 

@@ -336,7 +336,7 @@ pub(crate) struct State {
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    fresh_tables: std::collections::HashMap<(u64, u32, u64, bool), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u64, u32, u32)>,
@@ -1517,7 +1517,7 @@ impl State {
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            let made = self.tables_with_raw(list, &t.used, &t.host.root_indexed_views, compute, t.raw_cbv_only);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -3205,6 +3205,18 @@ impl State {
         indexed: &[RootIndexedView],
         compute: bool,
     ) -> Few<(u8, u32), 16> {
+        self.tables_with_raw(list, used, indexed, compute, false)
+    }
+
+    fn tables_with_raw(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        indexed: &[RootIndexedView],
+        compute: bool,
+        raw_cbv_only: bool,
+    ) -> Few<(u8, u32), 16> {
+        let raw16 = raw_cbv_only && crate::port_cbv::raw16_on();
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Few<u8, 16> = Few::default();
         for u in used.iter().filter(tables).filter(|u| u.kind == ResourceType::Cbv) {
@@ -3296,7 +3308,9 @@ impl State {
                     // SAFETY: a descriptor slot in title memory.
                     h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
                 }
-                (table, n, h.0)
+                // Raw-only tables cannot be reused by a stage that reads
+                // conventional CBVs. Keep distinct dynamic slot ranges.
+                (table, n, h.0, raw16)
             };
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (used.as_ptr() as usize, used.len(), STORES.get(), TESTED_DEPTH.get().0);
@@ -3435,10 +3449,12 @@ impl State {
                             if rounded != 0 && u64::from(size) <= rounded {
                                 match crate::shadow::find(address, rounded).filter(|s| s.in_place() && s.left(address) >= rounded) {
                                     Some(shadow) => {
-                                        if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
+                                        let gpu = shadow.gpu(address);
+                                        let raw_only = raw16 && used.is_some_and(|u| u.kind == ResourceType::Cbv);
+                                        if host.constant_raw_at(index, &shadow.buffer, gpu, size, raw_only) {
                                             // Keep the resource alive with the recording, independently of the heap slot.
                                             list.keep(&shadow.buffer);
-                                            crate::port_cbv::in_place(size);
+                                            crate::port_cbv::in_place(size, !gpu.is_multiple_of(256));
                                             continue;
                                         }
                                         crate::port_cbv::copied(false);

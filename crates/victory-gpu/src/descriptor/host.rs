@@ -2886,7 +2886,7 @@ impl HostHeap {
     /// Renderer port 5: use a title-memory buffer directly in a dynamic
     /// table slot. Both the ordinary CBV and raw SRV twin must remain valid.
     /// Refuse unaligned or truncated spans; the caller copies as before.
-    pub(crate) fn constant_raw_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) -> bool {
+    pub(crate) fn constant_raw_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32, raw_only: bool) -> bool {
         let Some(host) = host() else { return false };
         let twin = self.twin(index);
         // SAFETY: a live buffer.
@@ -2894,11 +2894,11 @@ impl HostHeap {
         let Some(offset) = gpu.checked_sub(base).filter(|&o| o < width && crate::port_cbv::raw_ok(o)) else {
             return false;
         };
-        // The same slot can be consumed as a CBV by another shader.
-        // Preserve a real CBV and the full rounded span, otherwise take the
-        // existing scratch-copy path (which makes both descriptor types).
+        // Only a stage proven to have no conventional heap CBV load may
+        // use a raw-only slot. The twin must exist on this host.
         let bytes = u64::from(constant_bytes(size));
-        if bytes == 0 || !gpu.is_multiple_of(256) || bytes > width - offset {
+        if bytes == 0 || bytes > width - offset
+            || !crate::port_cbv::alignment_ok(gpu, raw_only && twin.is_some()) {
             return false;
         }
         let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -2914,9 +2914,10 @@ impl HostHeap {
                 },
             },
         };
-        let cbv = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-            BufferLocation: gpu,
-            SizeInBytes: bytes as u32,
+        let cbv = if gpu.is_multiple_of(256) {
+            D3D12_CONSTANT_BUFFER_VIEW_DESC { BufferLocation: gpu, SizeInBytes: bytes as u32 }
+        } else {
+            D3D12_CONSTANT_BUFFER_VIEW_DESC::default()
         };
         // SAFETY: slots of our heaps; the ranges lie in the live buffer (a
         // zero location makes a null constant buffer view).

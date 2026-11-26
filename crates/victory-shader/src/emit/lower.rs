@@ -50,6 +50,7 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
+    pub raw_cbv_only: bool,
     /// Bit n: immediate sampler n is a comparison sampler.
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
@@ -301,6 +302,8 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
+    conventional_heap_cbv: bool,
+    raw_table_cbv: bool,
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
@@ -1664,6 +1667,8 @@ impl<'a> Lower<'a> {
                 m
             },
             handles: HashMap::new(),
+            conventional_heap_cbv: false,
+            raw_table_cbv: false,
             strides: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
@@ -2423,6 +2428,7 @@ impl<'a> Lower<'a> {
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
         Ok(Lowered {
+            raw_cbv_only: self.raw_table_cbv && !self.conventional_heap_cbv,
             wave_size,
             cmp_samplers,
             root_cbvs,
@@ -6759,7 +6765,9 @@ impl<'a> Lower<'a> {
         {
             return Ok(None);
         }
-        Ok(Some(self.handle(site, src, false, (11, 0))?))
+        let h = self.handle(site, src, false, (11, 0))?;
+        self.raw_table_cbv = true;
+        Ok(Some(h))
     }
 
     /// The dword at a computed byte address of a constant buffer.
@@ -7201,6 +7209,11 @@ impl<'a> Lower<'a> {
         sampler: bool,
         props: (u32, u32),
     ) -> Result<V, Why> {
+        // A conventional heap CBV can alias any entry of a fresh table.
+        // Refuse raw-only placement for the whole stage in that case.
+        if !sampler && props.0 & 0xff == 13 && !matches!(src, Source::Built { .. }) {
+            self.conventional_heap_cbv = true;
+        }
         match src {
             Source::Loaded { load, first } => {
                 let key = (self.cur, *load, *first, sampler, props);

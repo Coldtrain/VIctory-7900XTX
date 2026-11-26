@@ -392,6 +392,24 @@ pub struct UserData {
 /// with that on for every program, 8,551 pixel programs of the title that
 /// already translated came out changed (an extra evaluation in each), for
 /// the sake of 9 that did not translate.
+// Proof is associated with the exact selected DXIL, not merely the last
+// lowering attempt (wave64 retries can select an earlier successful form).
+thread_local! {
+    static CBV_PROOFS: std::cell::RefCell<Option<Vec<Vec<u8>>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Translate and return whether the selected shader has raw table CBVs and
+/// no conventional heap CBV loads. Unknown or unrecorded forms are false.
+pub fn translate_with_cbv_proof(container: &[u8]) -> Result<(HostShader, bool), ShaderError> {
+    CBV_PROOFS.with(|p| *p.borrow_mut() = Some(Vec::new()));
+    let result = translate(container);
+    let proofs = CBV_PROOFS.with(|p| p.borrow_mut().take().unwrap_or_default());
+    result.map(|s| {
+        let raw_only = proofs.iter().any(|dxil| dxil == &s.dxil);
+        (s, raw_only)
+    })
+}
+
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     match translate_plain(container) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
@@ -775,6 +793,13 @@ fn emit_program(
         mesh_stride,
     })?;
     let wave_size = l.wave_size;
+    if l.raw_cbv_only {
+        CBV_PROOFS.with(|p| {
+            if let Some(proofs) = p.borrow_mut().as_mut() {
+                proofs.push(l.dxil.clone());
+            }
+        });
+    }
     let shader = HostShader {
         stage: native.stage,
         dxil: l.dxil,

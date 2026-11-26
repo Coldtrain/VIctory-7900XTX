@@ -21,11 +21,25 @@ pub(crate) fn in_place_on() -> bool {
     })
 }
 
-static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// Experimental 16-byte placement, independently reversible.
+pub(crate) fn raw16_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| on() && in_place_on() && std::env::var_os("VICTORY_PORT_CBV_RAW16").is_some_and(|v| v == "1"))
+}
 
-pub(crate) fn in_place(size: u32) {
+pub(crate) fn alignment_ok(gpu: u64, raw_only: bool) -> bool {
+    gpu.is_multiple_of(256) || (raw_only && raw_ok(gpu))
+}
+
+static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+pub(crate) fn in_place(size: u32, raw16: bool) {
     STATS[0].fetch_add(1, Relaxed);
     STATS[1].fetch_add(u64::from(size), Relaxed);
+    if raw16 {
+        STATS[6].fetch_add(1, Relaxed);
+        STATS[7].fetch_add(u64::from(size), Relaxed);
+    }
 }
 
 pub(crate) fn copied(not_in_place: bool) {
@@ -51,15 +65,23 @@ pub(crate) fn log(frames: f64) {
     }
     let s = STATS.each_ref().map(|v| v.swap(0, Relaxed) as f64 / frames.max(1e-9));
     tracing::info!(
-        placement, raw_tables = raw,
-        "renderer port 5 per frame: {:.0} tables' constant buffers read by the card in place ({:.1} KB not copied, no step at submission); {:.0} scratch copies ({:.1} KB copied); rejected placement: {:.0} not in place/full span, {:.0} unaligned or invalid",
-        s[0], s[1] / 1024.0, s[4], s[5] / 1024.0, s[2], s[3],
+        placement, raw_tables = raw, raw16 = raw16_on(),
+        "renderer port 5 per frame: {:.0} tables' constant buffers read by the card in place ({:.1} KB not copied, no step at submission); {:.0} scratch copies ({:.1} KB copied); rejected placement: {:.0} not in place/full span, {:.0} unaligned or invalid; raw16-only: {:.0} buffers ({:.1} KB saved)",
+        s[0], s[1] / 1024.0, s[4], s[5] / 1024.0, s[2], s[3], s[6], s[7] / 1024.0,
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_only_alignment_is_never_used_for_conventional_cbvs() {
+        assert!(alignment_ok(0x100, false));
+        assert!(!alignment_ok(0x110, false));
+        assert!(alignment_ok(0x110, true));
+        assert!(!alignment_ok(0x114, true));
+    }
 
     #[test]
     fn raw_views_need_sixteen_bytes() {
