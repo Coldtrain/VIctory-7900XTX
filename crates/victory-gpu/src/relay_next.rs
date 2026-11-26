@@ -221,6 +221,25 @@ pub(crate) fn independent_flights() -> bool {
     *ON.get_or_init(|| ticket_overlap() && std::env::var_os("VICTORY_RELAY_NEXT_INDEPENDENT_FLIGHTS").is_some_and(|v| v == "1"))
 }
 
+/// R12d: retain title fence signals behind their actual GPU fence,
+/// rather than forcing the lane to wait at every signal.
+pub(crate) fn ordered_signals() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| independent_flights() && std::env::var_os("VICTORY_RELAY_NEXT_ORDERED_SIGNALS").is_some_and(|v| v == "1"))
+}
+
+pub(crate) fn signal_stats(kind: usize, n: u64) {
+    static COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    let count = COUNTS[kind].fetch_add(n, Ordering::Relaxed) + n;
+    if count == n || count.is_multiple_of(256) || trace() {
+        tracing::info!(signals_deferred = COUNTS[0].load(Ordering::Relaxed),
+            signals_published = COUNTS[1].load(Ordering::Relaxed),
+            blocked_wait_drains = COUNTS[2].load(Ordering::Relaxed),
+            early_lands = COUNTS[3].load(Ordering::Relaxed),
+            "Relay Next R12d ordered signal statistics");
+    }
+}
+
 /// Counts the independent path separately from R12a's grouped tickets.
 pub(crate) fn flight_stats(kind: usize) {
     static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];

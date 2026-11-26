@@ -295,6 +295,13 @@ impl<W: Work> Lane<W> {
         let (number, forced) = match ready {
             Some(head) => (head.0, false),
             None => {
+                // A retained signal may unblock a queue. Publish it and
+                // recheck actual wait values before the old forced path.
+                if crate::relay_next::ordered_signals() && W::pending() {
+                    crate::relay_next::signal_stats(2, 1);
+                    W::flush();
+                    return true;
+                }
                 // Nothing is free to run. With a present in the line the
                 // oldest goes on regardless: a wait is not kept across
                 // frames (`super::present`). (Not while there is work whose
@@ -587,9 +594,14 @@ impl Work for Job {
     }
 
     fn go(self, forced: bool) {
-        // Never publish a fence, present or pass a wait while a deferred
-        // recording is outstanding. The lane is the only producer.
-        if !matches!(&self, Job::Run(..) | Job::Joined(..)) {
+        // A signal can follow the earlier GPU fence without blocking
+        // the lane here. Waits, presents and all other visibility points
+        // retain the conservative R12c drain.
+        let held_signal = match &self {
+            Job::Signal(fence, value) => crate::host::next_defer_signal(*fence, *value),
+            _ => false,
+        };
+        if !held_signal && !matches!(&self, Job::Run(..) | Job::Joined(..)) {
             crate::host::next_drain();
         }
         let began = Instant::now();
@@ -639,7 +651,7 @@ impl Work for Job {
                 }
             }
             Job::Signal(fence, value) => {
-                if !crate::host::late_signal(fence, value) {
+                if !held_signal && !crate::host::late_signal(fence, value) {
                     crate::fence::set(fence as This, value);
                 }
             }

@@ -2986,6 +2986,8 @@ struct Sent {
 struct NextFlight {
     number: u64,
     fence: u64,
+    // Each retained signal owns a title fence reference until publication.
+    signals: Vec<(usize, u64)>,
     ticket: crate::relay_next::Ticket,
     lists: Vec<crate::list::Detached>,
     order: Vec<usize>,
@@ -3014,6 +3016,23 @@ pub(crate) fn next_drain() {
         drop(submitted);
         land();
     }
+}
+
+/// The submission lock protects both the pending recording and its
+/// ordered signals. Bound their count, falling back to the normal drain.
+pub(crate) fn next_defer_signal(fence: usize, value: u64) -> bool {
+    if !crate::relay_next::ordered_signals() || !next_flight_pending() {
+        return false;
+    }
+    let Some(host) = host() else { return false; };
+    let _submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    let mut slot = next_flight_slot();
+    let Some(flight) = slot.as_mut() else { return false; };
+    if flight.signals.len() >= 64 { return false; }
+    crate::object::add_ref(fence as crate::object::This);
+    flight.signals.push((fence, value));
+    crate::relay_next::signal_stats(0, 1);
+    true
 }
 
 /// A later submission may prepare only GPU-private carded refreshes
@@ -5996,7 +6015,7 @@ impl Host {
                 let ticket = sent.next.take().expect("R12c independent ticket");
                 let mut slot = next_flight_slot();
                 assert!(slot.is_none(), "R12c independent flight bound");
-                *slot = Some(NextFlight { number: sent.number, fence: *submitted, ticket, lists, order });
+                *slot = Some(NextFlight { number: sent.number, fence: *submitted, signals: Vec::new(), ticket, lists, order });
                 NEXT_FLIGHT_LIVE.store(true, Ordering::Release);
                 drop(slot);
                 drop(submitted);
@@ -6142,6 +6161,15 @@ impl Host {
         FINISHED.store(flight.number, Ordering::Release);
         bury(flight.number);
         line().landed.push((flight.lists, flight.order));
+        // Only after the real GPU fence, and in the original signal order.
+        let count = flight.signals.len();
+        for (fence, value) in flight.signals {
+            let fence = fence as crate::object::This;
+            crate::fence::set(fence, value);
+            // The fence's actual Release drops the boxed object if needed.
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(fence, 0x10)(fence);
+        }
+        if count != 0 { crate::relay_next::signal_stats(1, count as u64); }
         NEXT_FLIGHT_LIVE.store(false, Ordering::Release);
         crate::relay_next::flight_stats(4);
     }
@@ -6825,6 +6853,14 @@ impl Host {
                         // fence. Leave the lease pinned; the lane transfers
                         // ownership of the detached recording under this lock.
                         continue;
+                    }
+                    // The second ticket has been sent. Land the first at
+                    // its own fence, so its signals need not wait for the
+                    // second ticket's execution or readback.
+                    if crate::relay_next::ordered_signals() && earlier.is_some() {
+                        self.next_drain_locked(&mut submitted);
+                        earlier = None;
+                        crate::relay_next::signal_stats(3, 1);
                     }
                     working(false);
                     #[cfg(feature = "diagnostics")]

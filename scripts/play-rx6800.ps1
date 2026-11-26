@@ -13,7 +13,7 @@ $game = (Resolve-Path -LiteralPath $Exe -ErrorAction Stop).Path
 
 $settings = @{
     # Port of the NVIDIA fork's resolution-only settings; no GPU vendor changes.
-    VICTORY_RENDER_SCALE = '0.5'
+    VICTORY_RENDER_SCALE = '0.20'
     VICTORY_OWN_UPSCALER = '1'
     VICTORY_RELAY = '0'
     VICTORY_LATE_WAIT = '0'
@@ -35,6 +35,7 @@ $settings = @{
     VICTORY_RELAY_NEXT_TICKET_OVERLAP = '1'
     VICTORY_RELAY_NEXT_OVERLAP_COMPARE = '1'
     VICTORY_RELAY_NEXT_INDEPENDENT_FLIGHTS = '1'
+    VICTORY_RELAY_NEXT_ORDERED_SIGNALS = '1'
     VICTORY_RELAY_NEXT_MERGE_WORKERS = '4'
     VICTORY_RELAY_NEXT_TRACE = '0'
     VICTORY_ASYNC_SUBMIT = '1'
