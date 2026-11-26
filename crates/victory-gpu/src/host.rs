@@ -4506,6 +4506,7 @@ impl Host {
             }
             None => (self.make_prelude()?, None),
         };
+        tracing::info!(exact = relay_exact(), dedicated_copy_queue = queue.is_some(), "relay readback queue initialized");
         // SAFETY: plain objects of our own.
         unsafe {
             let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
@@ -4679,14 +4680,25 @@ impl Host {
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 let _fetching = crate::timeline::span("landing: fetching pieces");
                 if let Some(queue) = &copy_queue {
+                    // A copy queue must not read buffers concurrently with
+                    // graphics writes. Insert a GPU-side round trip before
+                    // allowing later graphics work to access these buffers.
+                    let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                    let ready = sent.checked_mul(2).expect("relay fence overflow");
+                    let done = ready + 1;
+                    self.queue.Signal(&fence, ready)?;
+                    queue.Wait(&fence, ready)?;
                     queue.ExecuteCommandLists(&lists);
-                    queue.Signal(&fence, sent)?;
+                    queue.Signal(&fence, done)?;
+                    self.queue.Wait(&fence, done)?;
+                    let after = *order;
+                    drop(order);
                     meanwhile();
-                    fence.SetEventOnCompletion(sent, event)?;
+                    fence.SetEventOnCompletion(done, event)?;
                     #[cfg(feature = "diagnostics")]
                     let _card = crate::timeline::card_wait(None);
                     WaitForSingleObject(event, INFINITE);
-                    return Ok(behind);
+                    return Ok(after);
                 }
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
