@@ -2995,10 +2995,11 @@ struct NextFlight {
 // SAFETY: as for Line: detached recordings have one owner, and all
 // accesses to this slot are serialized by the host submission lock.
 unsafe impl Send for NextFlight {}
-static NEXT_FLIGHT: Mutex<Option<NextFlight>> = Mutex::new(None);
+static NEXT_FLIGHT: Mutex<std::collections::VecDeque<NextFlight>> =
+    Mutex::new(std::collections::VecDeque::new());
 static NEXT_FLIGHT_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn next_flight_slot() -> std::sync::MutexGuard<'static, Option<NextFlight>> {
+fn next_flight_slot() -> std::sync::MutexGuard<'static, std::collections::VecDeque<NextFlight>> {
     NEXT_FLIGHT.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -3028,17 +3029,12 @@ pub(crate) fn next_poll() {
         Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => return,
     };
-    let target = next_flight_slot().as_ref().map(|flight| flight.fence);
-    let Some(target) = target else { return; };
-    let completed = unsafe { host.fence.GetCompletedValue() };
-    if completed == u64::MAX || completed >= target {
-        host.next_drain_locked(&mut submitted);
-        drop(submitted);
-        land();
-        crate::relay_next::persistent_stats(1);
-    } else {
-        crate::relay_next::persistent_stats(0);
-    }
+    // Retire only the completed prefix. A newer incomplete ticket
+    // must not turn an ordinary poll into a wait for the whole queue.
+    host.next_retire_completed(&mut submitted);
+    drop(submitted);
+    land();
+    if next_flight_pending() { crate::relay_next::persistent_stats(0); }
 }
 
 /// The submission lock protects both the pending recording and its
@@ -3050,7 +3046,7 @@ pub(crate) fn next_defer_signal(fence: usize, value: u64) -> bool {
     let Some(host) = host() else { return false; };
     let _submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
     let mut slot = next_flight_slot();
-    let Some(flight) = slot.as_mut() else { return false; };
+    let Some(flight) = slot.back_mut() else { return false; };
     if flight.signals.len() >= 64 { return false; }
     crate::object::add_ref(fence as crate::object::This);
     flight.signals.push((fence, value));
@@ -6037,8 +6033,10 @@ impl Host {
             if let Some((submitted, mut sent)) = sent {
                 let ticket = sent.next.take().expect("R12c independent ticket");
                 let mut slot = next_flight_slot();
-                assert!(slot.is_none(), "R12c independent flight bound");
-                *slot = Some(NextFlight { number: sent.number, fence: *submitted, signals: Vec::new(), ticket, lists, order });
+                assert!(slot.len() < crate::relay_next::max_flights(), "R12f independent flight bound");
+                assert!(slot.back().is_none_or(|f| f.number < sent.number && f.fence < *submitted),
+                    "R12f unordered independent ticket");
+                slot.push_back(NextFlight { number: sent.number, fence: *submitted, signals: Vec::new(), ticket, lists, order });
                 NEXT_FLIGHT_LIVE.store(true, Ordering::Release);
                 drop(slot);
                 drop(submitted);
@@ -6167,8 +6165,26 @@ impl Host {
 
     /// R12c uses the same shared event only while holding submitted.
     /// Finish the earlier ticket in order; recycle outside that lock.
-    fn next_drain_locked(&self, _submitted: &mut u64) {
-        let Some(mut flight) = next_flight_slot().take() else { return; };
+    fn next_drain_locked(&self, submitted: &mut u64) {
+        while self.next_retire_one(submitted) {}
+    }
+
+    /// Only completed flights may be retired by a nonblocking poll.
+    fn next_retire_completed(&self, submitted: &mut u64) {
+        loop {
+            let target = next_flight_slot().front().map(|flight| flight.fence);
+            let Some(target) = target else { break; };
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            if completed != u64::MAX && completed < target { break; }
+            if !self.next_retire_one(submitted) { break; }
+            crate::relay_next::persistent_stats(1);
+        }
+    }
+
+    /// Retire exactly the oldest ticket, retaining all newer recordings.
+    /// The submission lock serializes the shared fence event.
+    fn next_retire_one(&self, _submitted: &mut u64) -> bool {
+        let Some(mut flight) = next_flight_slot().pop_front() else { return false; };
         let waiting = std::time::Instant::now();
         let completed = unsafe { self.fence.GetCompletedValue() };
         if completed == u64::MAX || completed >= flight.fence {
@@ -6193,8 +6209,9 @@ impl Host {
             crate::fence::release(fence);
         }
         if count != 0 { crate::relay_next::signal_stats(1, count as u64); }
-        NEXT_FLIGHT_LIVE.store(false, Ordering::Release);
+        NEXT_FLIGHT_LIVE.store(!next_flight_slot().is_empty(), Ordering::Release);
         crate::relay_next::flight_stats(4);
+        true
     }
 
     /// Waits for the card to run every flight in the air ([`late`]) and
@@ -6404,7 +6421,20 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        let mut earlier = next_flight_slot().as_ref().map(|flight| flight.fence);
+        let multi = crate::relay_next::max_flights() > 2;
+        if multi {
+            self.next_retire_completed(&mut submitted);
+            // Leave one slot available for the new independent submission.
+            // Never drain the whole FIFO merely because it is full.
+            while next_flight_slot().len() >= crate::relay_next::max_flights() {
+                let owned = next_flight_slot().len();
+                let completed = unsafe { self.fence.GetCompletedValue() };
+                let incomplete = next_flight_slot().iter().filter(|f| f.fence > completed).count();
+                crate::relay_next::fifo_stats(owned, incomplete, true);
+                self.next_retire_one(&mut submitted);
+            }
+        }
+        let mut earlier = next_flight_slot().back().map(|flight| flight.fence);
         if earlier.is_some() && (!next_fly || !parts.is_empty() || !next_independent_prepare(runs)) {
             crate::relay_next::flight_stats(5);
             self.next_drain_locked(&mut submitted);
@@ -6821,7 +6851,7 @@ impl Host {
         }
         // At most one independently deferred ticket plus the current
         // ticket. Never defer a group, or any plan that needs landing.
-        let defer_next = next_fly && earlier.is_none() && parts.is_empty()
+        let defer_next = next_fly && (earlier.is_none() || multi) && parts.is_empty()
             && second_ticket.is_none() && card.is_none() && declared.is_empty()
             && picked.written.is_empty() && picked.looked.is_empty()
             && groups.len() == 1 && next_no_visibility(runs)
@@ -6871,6 +6901,16 @@ impl Host {
                 crate::timeline::sent(sending, *submitted, stamp);
                 if !paired_batches || i + 1 == groups.len() {
                     drop(next_descriptor_horizon.take());
+                    if multi && (defer_next || earlier.is_some()) {
+                        // Sample after queue.Signal, before any waits. A
+                        // retained ticket may already have completed; only
+                        // genuinely incomplete fences count as GPU work.
+                        let actual = unsafe { self.fence.GetCompletedValue() };
+                        let slot = next_flight_slot();
+                        let pending = slot.iter().filter(|f| f.fence > actual).count()
+                            + usize::from(*submitted > actual);
+                        crate::relay_next::fifo_stats(slot.len() + 1, pending, false);
+                    }
                     if defer_next {
                         // The queue has accepted the command list and its
                         // fence. Leave the lease pinned; the lane transfers

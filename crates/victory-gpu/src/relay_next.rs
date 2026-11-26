@@ -260,6 +260,38 @@ pub(crate) fn persistent_stats(kind: usize) {
     }
 }
 
+/// Maximum independent title tickets including the one being prepared.
+/// A limit of two retains the R12e one-earlier-flight policy.
+pub(crate) fn max_flights() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| if persistent_flights() {
+        std::env::var("VICTORY_RELAY_NEXT_MAX_FLIGHTS").ok()
+            .and_then(|v| v.parse::<usize>().ok()).unwrap_or(2).clamp(2, 8)
+    } else { 2 })
+}
+
+/// Count actual incomplete fences, not merely allocated ticket objects.
+pub(crate) fn fifo_stats(owned: usize, incomplete: usize, capacity_wait: bool) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static PEAK: AtomicU64 = AtomicU64::new(0);
+    static GPU_PEAK: AtomicU64 = AtomicU64::new(0);
+    static MULTI: AtomicU64 = AtomicU64::new(0);
+    static THREE: AtomicU64 = AtomicU64::new(0);
+    static CAP: AtomicU64 = AtomicU64::new(0);
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    let prev = GPU_PEAK.fetch_max(incomplete as u64, Ordering::Relaxed);
+    PEAK.fetch_max(owned as u64, Ordering::Relaxed);
+    if incomplete >= 2 { MULTI.fetch_add(1, Ordering::Relaxed); }
+    if incomplete >= 3 { THREE.fetch_add(1, Ordering::Relaxed); }
+    if capacity_wait { CAP.fetch_add(1, Ordering::Relaxed); }
+    if calls == 1 || calls.is_multiple_of(256) || incomplete as u64 > prev || trace() {
+        tracing::info!(calls, owned, incomplete, limit = max_flights(),
+            peak_owned = PEAK.load(Ordering::Relaxed), peak_gpu_incomplete = GPU_PEAK.load(Ordering::Relaxed),
+            multi_gpu_samples = MULTI.load(Ordering::Relaxed), three_plus_gpu_samples = THREE.load(Ordering::Relaxed),
+            capacity_waits = CAP.load(Ordering::Relaxed), "Relay Next R12f independent ticket FIFO statistics");
+    }
+}
+
 /// Counts the independent path separately from R12a's grouped tickets.
 pub(crate) fn flight_stats(kind: usize) {
     static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
@@ -532,7 +564,7 @@ impl Ticket {
     pub(crate) fn new(number: u64) -> Self {
         static START: std::sync::Once = std::sync::Once::new();
         START.call_once(|| tracing::info!(
-            mode = mode(), max_batches = if scheduler() { scheduler_parts().max(2) + usize::from(scheduler_parts() >= 2) } else if paired() { 2 } else { 1 }, max_title_tickets = if ticket_overlap() { 2 } else { 1 }, copy_queue = false,
+            mode = mode(), max_batches = if scheduler() { scheduler_parts().max(2) + usize::from(scheduler_parts() >= 2) } else if paired() { 2 } else { 1 }, max_title_tickets = if ticket_overlap() { max_flights() } else { 1 }, copy_queue = false,
             independent_scheduler = scheduler(), queue_depth = scheduler_depth(), dependency_batches = dependency_batches(),
             private_snapshots = snapshots(), parallel_landing = parallel_landing(), merge_workers = merge_workers(),
             resident_rehash = crate::host::next_resident_rehash(), resident_merge = resident_merge(),
