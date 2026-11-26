@@ -673,6 +673,37 @@ fn prep_trace(event: impl FnOnce() -> String) {
 }
 
 // Only called at submission phase boundaries, not for every draw.
+// Serialize publication of mutable indexed descriptors against queue
+// submission. The horizon is a GPU fence, not CPU landing completion.
+static DESCRIPTOR_HORIZON: Mutex<u64> = Mutex::new(0);
+
+fn descriptor_fence_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| relay_exact() && std::env::var_os("VICTORY_DESCRIPTOR_FENCE").is_none_or(|v| v != "0"))
+}
+
+pub(crate) fn descriptor_publication(host: &Host) -> Option<std::sync::MutexGuard<'static, u64>> {
+    if !descriptor_fence_on() { return None; }
+    let guard = DESCRIPTOR_HORIZON.lock().unwrap_or_else(|e| e.into_inner());
+    let target = *guard;
+    // SAFETY: a live fence; a null event requests a synchronous fence wait.
+    let result = unsafe {
+        let completed = host.fence.GetCompletedValue();
+        if completed < target {
+            prep_trace(|| format!("descriptor publication wait begin target={target} completed={completed}"));
+            host.fence.SetEventOnCompletion(target, HANDLE::default())
+                .and_then(|()| host.device.GetDeviceRemovedReason())
+        } else {
+            host.device.GetDeviceRemovedReason()
+        }
+    };
+    if let Err(e) = result {
+        drop(guard);
+        fail(format_args!("descriptor publication fence {target} failed ({e})"));
+    }
+    Some(guard)
+}
+
 fn prep_checkpoint(device: &ID3D12Device, phase: &str) {
     if !relay_trace_on() { return; }
     relay_trace(|| format!("prepare phase={phase}"));
@@ -5836,6 +5867,7 @@ impl Host {
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
             relay_trace(|| format!("submit begin number={this_submission} fence={} lists={} cuts={:?} compare={}", *submitted, lists.len(), cuts, card.as_ref().is_some_and(|c| c.check.is_some())));
             // SAFETY: closed lists; the fence is ours.
+            let mut descriptor_horizon = descriptor_fence_on().then(|| DESCRIPTOR_HORIZON.lock().unwrap_or_else(|e| e.into_inner()));
             let signalled = unsafe {
                 let mut from = 0;
                 // Buffer state decay occurs at ExecuteCommandLists boundaries,
@@ -5857,6 +5889,10 @@ impl Host {
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
+            if let Some(horizon) = descriptor_horizon.as_mut() {
+                **horizon = *submitted;
+            }
+            drop(descriptor_horizon);
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
             crate::timeline::sent(sending, *submitted, stamp);
@@ -5906,6 +5942,7 @@ impl Host {
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
+            let mut descriptor_horizon = descriptor_fence_on().then(|| DESCRIPTOR_HORIZON.lock().unwrap_or_else(|e| e.into_inner()));
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
@@ -5914,6 +5951,10 @@ impl Host {
                     .queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                if let Some(horizon) = descriptor_horizon.as_mut() {
+                    **horizon = *submitted;
+                }
+                drop(descriptor_horizon);
                 #[cfg(feature = "diagnostics")]
                 crate::timeline::sent(sending, *submitted, stamp);
                 match waited {
