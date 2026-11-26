@@ -7539,10 +7539,20 @@ impl HostList {
     pub(crate) fn reset(&self) {
         self.assert_next_idle();
         prep_trace(|| format!("list reset begin list={:#x} allocator={:#x}", self.list.as_raw() as usize, self.allocator.as_raw() as usize));
-        self.changed_something();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
+        self.clear_for_reset();
+        self.reset_allocator();
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+    }
+
+    /// CPU-side cleanup stays on the original owner thread. The caller
+    /// must hold exclusive ownership and the previous ticket must be idle.
+    pub(crate) fn clear_for_reset(&self) {
+        self.assert_next_idle();
+        self.changed_something();
         self._alive.used();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
@@ -7562,7 +7572,16 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
-        // SAFETY: the list is not executing.
+    }
+
+    /// R13a: only the D3D12 allocator/list reset may be dispatched to a
+    /// recycle worker. No descriptor, deferred-work or scratch cleanup
+    /// is moved off the original owner. The list must be exclusively
+    /// owned and not published to the idle pool until this returns.
+    pub(crate) fn reset_allocator(&self) {
+        self.assert_next_idle();
+        // SAFETY: the previous GPU submission has completed and the
+        // caller owns this list and allocator exclusively.
         let reset = unsafe {
             self.allocator
                 .Reset()
@@ -7572,8 +7591,6 @@ impl HostList {
             fail(format_args!("a host command list did not reset ({e})"));
         }
         prep_trace(|| format!("list reset end list={:#x}", self.list.as_raw() as usize));
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
 
     /// Something changed in this list that bringing a draw's textures and
