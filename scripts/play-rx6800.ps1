@@ -1,6 +1,8 @@
 param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Parallel,
+    [switch]$CoolFoxResidency,
+    [switch]$CoolFoxThin,
     [hashtable]$More = @{}
 )
 
@@ -60,6 +62,21 @@ if ($Parallel) {
     $settings.VICTORY_UPLOAD_WORKERS = '8'
     $settings.VICTORY_INLINE_READBACK = '1'
     $settings.VICTORY_LOG = 'warn,victory_gpu::host=info,victory_gpu::relay_next=info,victory_gpu::list::thin=info,victory_gpu::queue::behind=info,victory_gpu::texture::ahead=info'
+}
+# Configuration experiments from codec-d/cool_fox Play-VIctory.cmd.
+# Source: https://github.com/codec-d/cool_fox/blob/main/Play-VIctory.cmd
+# Only use switches already implemented in our R13c source. Keep the
+# established Relay Next mode, console profile, and visibility rules.
+# Test one switch at a time; neither is enabled by default.
+if ($CoolFoxResidency) {
+    $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'
+    # Keep the existing adapter-specific allocation budget and residency guards.
+}
+if ($CoolFoxThin) {
+    $settings.VICTORY_THIN = '1'
+    $settings.VICTORY_THIN_THREADS = '8'
+    # Unlike -Parallel, do not enable inline readback or change upload workers.
+    $settings.VICTORY_LOG = 'warn,victory_gpu::host=info,victory_gpu::relay_next=info,victory_gpu::list::thin=info,victory_gpu::queue::behind=info'
 }
 foreach ($name in $More.Keys) { $settings[$name] = $More[$name] }
 
