@@ -2561,7 +2561,7 @@ mod relay_tests {
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
+        std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or_else(|| if relay() { 32 } else { 256 }).max(1)
     })
 }
 
