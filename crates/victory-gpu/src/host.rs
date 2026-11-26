@@ -6101,8 +6101,9 @@ impl Host {
         let mut total = 0u64;
         let packed = plan.next_snapshot.as_ref().is_some_and(|s| s.packed)
             .then(|| NextPackLayout::new(results.2, next_card_piece_bytes()));
+        let packed_base = results.1;
         let mut packed_offsets = Vec::new();
-        let mut packed_complete = packed.is_some();
+        let mut fetch_bytes = 0u64;
         plan.picked_found(differs);
         for (i, r) in plan.ranges.iter().enumerate().filter(|(_, r)| !r.picked) {
             for p in 0..r.span.pieces {
@@ -6111,10 +6112,9 @@ impl Host {
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
                 if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
-                    pieces.push((i, lo, hi, total));
+                    pieces.push((i, lo, hi, fetch_bytes));
                     total += (hi - lo) as u64;
-                    if packed_complete {
-                        let layout = packed.unwrap();
+                    if let Some(layout) = packed {
                         let offset = if r.compared {
                             // SAFETY: completed comparison, unique valid
                             // result index, table allocated beside flags.
@@ -6123,22 +6123,24 @@ impl Host {
                             let (hashed_lo, hashed_hi) = r.shadow.card_hashed(r.span.first + p);
                             layout.offset(entry, lo, hi, hashed_lo, hashed_hi)
                         } else { None };
-                        if let Some(offset) = offset { packed_offsets.push(offset); }
-                        else { packed_complete = false; }
+                        packed_offsets.push(offset);
+                        if offset.is_none() { fetch_bytes += (hi - lo) as u64; }
+                    } else {
+                        fetch_bytes += (hi - lo) as u64;
                     }
                 }
             }
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
         }
         let mut written = vec![0usize; plan.ranges.len()];
-        if !pieces.is_empty() && packed_complete {
+        if !pieces.is_empty() && fetch_bytes == 0 {
             // No second GPU command list or fence wait. Merge in precisely
             // the original order, after the render/compare fence completed.
             let mut title = Vec::new();
             for (&(i, lo, hi, _), &offset) in pieces.iter().zip(&packed_offsets) {
                 // SAFETY: bounded slot and range checked above; private
                 // arena is retained until this entire CPU merge finishes.
-                let gpu = unsafe { std::slice::from_raw_parts((results.1 + offset) as *const u8, hi - lo) };
+                let gpu = unsafe { std::slice::from_raw_parts((results.1 + offset.expect("all pieces packed")) as *const u8, hi - lo) };
                 let merged = plan.ranges[i].shadow.card_merge(lo, gpu, &mut title);
                 plan.ranges[i].shadow.walls_merged(gpu.len(), merged);
                 written[i] += merged;
@@ -6155,8 +6157,8 @@ impl Host {
             } else {
                 (&mut work.fetched, &work.fetch)
             };
-            if fetch_buffer.as_ref().is_none_or(|f| f.2 < total) {
-                let size = total.next_multiple_of(16 << 20);
+            if fetch_buffer.as_ref().is_none_or(|f| f.2 < fetch_bytes) {
+                let size = fetch_bytes.next_multiple_of(16 << 20);
                 *fetch_buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
                 if plan.next_snapshot.is_some() {
                     tracing::info!(size, "Relay Next R4: private fetch storage resized");
@@ -6177,6 +6179,10 @@ impl Host {
                     // keep their original merge boundaries and order.
                     let mut p = 0;
                     while p < pieces.len() {
+                        if packed_offsets.get(p).is_some_and(Option::is_some) {
+                            p += 1;
+                            continue;
+                        }
                         let (i, lo, mut hi, at) = pieces[p];
                         let source = &plan.ranges[i].shadow;
                         p += 1;
@@ -6184,6 +6190,7 @@ impl Host {
                             let (j, next_lo, next_hi, next_at) = pieces[p];
                             if !crate::relay_next::fine_readback_on()
                                 || !std::sync::Arc::ptr_eq(source, &plan.ranges[j].shadow)
+                                || packed_offsets.get(p).is_some_and(Option::is_some)
                                 || next_lo != hi || next_at != at + (hi - lo) as u64 { break; }
                             hi = next_hi;
                             p += 1;
@@ -6221,7 +6228,18 @@ impl Host {
                 CARD_STATS[6].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             if crate::relay_next::fine_readback_on() {
-                crate::relay_next::readback_stats(pieces.len(), total, waiting.elapsed().as_micros() as u64);
+                let copied = if packed.is_some() {
+                    packed_offsets.iter().filter(|offset| offset.is_none()).count()
+                } else { pieces.len() };
+                crate::relay_next::readback_stats(copied, fetch_bytes, waiting.elapsed().as_micros() as u64);
+            }
+            // Resolve both retained mappings after the fallback fence. Merge
+            // in declaration order, including interleaved packed and fetched pieces.
+            for (index, (_, _, _, at)) in pieces.iter_mut().enumerate() {
+                *at = match packed_offsets.get(index).copied().flatten() {
+                    Some(offset) => (packed_base + offset) as u64,
+                    None => (*data + *at as usize) as u64,
+                };
             }
             let merging = std::time::Instant::now();
             let next_parallel = crate::relay_next::parallel_landing();
@@ -6237,7 +6255,6 @@ impl Host {
                         }).collect())
                 } else { wide_merge() });
             if parallel {
-                let fetched = *data;
                 let counts: std::sync::Arc<Vec<std::sync::atomic::AtomicUsize>> =
                     std::sync::Arc::new((0..plan.ranges.len()).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect());
                 let each = pieces.len().div_ceil(worker_count);
@@ -6253,7 +6270,7 @@ impl Host {
                                 // SAFETY: the mapping of the fetched bytes;
                                 // the copy into it has run, and the caller
                                 // waits for this job.
-                                let gpu = unsafe { std::slice::from_raw_parts((fetched + at as usize) as *const u8, hi - lo) };
+                                let gpu = unsafe { std::slice::from_raw_parts(at as *const u8, hi - lo) };
                                 let merged = shadow.card_merge(lo, gpu, &mut title);
                                 shadow.walls_merged(gpu.len(), merged);
                                 counts[i].fetch_add(merged, Ordering::Relaxed);
@@ -6268,9 +6285,8 @@ impl Host {
             } else {
                 let mut title = Vec::new();
                 for &(i, lo, hi, at) in &pieces {
-                    // SAFETY: the mapping of the fetched bytes, `total` of
-                    // them; the copy into it has run.
-                    let gpu = unsafe { std::slice::from_raw_parts((*data + at as usize) as *const u8, hi - lo) };
+                    // SAFETY: both mappings remain live and their GPU writes have completed.
+                    let gpu = unsafe { std::slice::from_raw_parts(at as *const u8, hi - lo) };
                     let merged = plan.ranges[i].shadow.card_merge(lo, gpu, &mut title);
                     plan.ranges[i].shadow.walls_merged(gpu.len(), merged);
                     written[i] += merged;
