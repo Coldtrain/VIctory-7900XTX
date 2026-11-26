@@ -1,4 +1,4 @@
-//! Relay Next, sprint R3: bounded GPU batches with recording ownership.
+//! Relay Next, sprint R4: private comparison and readback storage.
 //! Independent of the old relay flight queue. Preparation and title-memory
 //! merging deliberately retain the working synchronous implementation.
 
@@ -25,6 +25,11 @@ pub(crate) fn enabled() -> bool { mode() != 0 }
 /// R3 permits at most two tracked GPU batches in a single prepared ticket.
 /// Independent title submissions still complete in order.
 pub(crate) fn paired() -> bool { mode() == 2 }
+
+pub(crate) fn snapshots() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| paired() && std::env::var_os("VICTORY_RELAY_NEXT_SNAPSHOTS").is_none_or(|v| v != "0"))
+}
 
 fn trace() -> bool {
     static TRACE: OnceLock<bool> = OnceLock::new();
@@ -127,7 +132,8 @@ impl Ticket {
         static START: std::sync::Once = std::sync::Once::new();
         START.call_once(|| tracing::info!(
             mode = mode(), max_batches = if paired() { 2 } else { 1 }, max_title_tickets = 1, copy_queue = false,
-            "Relay Next R3: bounded GPU batches; legacy Relay disabled"
+            private_snapshots = snapshots(),
+            "Relay Next R4: private readback storage; legacy Relay disabled"
         ));
         Self { number, progress: Progress::new(), groups: 0, start: std::time::Instant::now(),
             leases: Vec::new(), lease_keys: HashSet::new(), pins: Vec::new(), pin_keys: HashSet::new() }
