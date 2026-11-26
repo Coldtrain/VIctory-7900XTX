@@ -1413,7 +1413,7 @@ fn next_prelude_stat(kind: usize, amount: u64) {
     }
 }
 
-fn next_record_prelude(mut job: PreludeJob) {
+fn next_try_prep(mut job: PreludeJob) -> Result<(), PreludeJob> {
     use std::sync::mpsc::TrySendError;
     static TURN: AtomicU64 = AtomicU64::new(0);
     let pool = next_prelude_workers();
@@ -1421,13 +1421,58 @@ fn next_record_prelude(mut job: PreludeJob) {
         let start = (TURN.fetch_add(1, Ordering::Relaxed) as usize) % pool.len();
         for i in 0..pool.len() {
             match pool[(start + i) % pool.len()].try_send(job) {
-                Ok(()) => { next_prelude_stat(0, 1); return; }
+                Ok(()) => return Ok(()),
                 Err(TrySendError::Full(back) | TrySendError::Disconnected(back)) => job = back,
             }
         }
     }
-    next_prelude_stat(2, 1);
-    job();
+    Err(job)
+}
+
+fn next_record_prelude(job: PreludeJob) {
+    match next_try_prep(job) {
+        Ok(()) => next_prelude_stat(0, 1),
+        Err(job) => {
+            next_prelude_stat(2, 1);
+            job();
+        }
+    }
+}
+
+/// R13d expands the existing bounded preparation pool, not the landing
+/// pool. Workers only handle immutable plans and privately owned lists.
+fn next_card_prep() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let enabled = crate::relay_next::enabled() && *ON.get_or_init(||
+        std::env::var_os("VICTORY_RELAY_NEXT_CARD_PREP").is_none_or(|v| v != "0"));
+    #[cfg(feature = "diagnostics")]
+    let enabled = enabled && !timing();
+    enabled && !next_prelude_workers().is_empty()
+}
+
+fn next_card_prep_stat(kind: usize, amount: u64) {
+    static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    let n = COUNTS[kind].fetch_add(amount, Ordering::Relaxed) + amount;
+    if kind < 2 && (n == 1 || n.is_multiple_of(256)) {
+        tracing::info!(range_jobs = COUNTS[0].load(Ordering::Relaxed),
+            compare_jobs = COUNTS[1].load(Ordering::Relaxed),
+            range_join_us = COUNTS[2].load(Ordering::Relaxed),
+            compare_join_us = COUNTS[3].load(Ordering::Relaxed),
+            fallback = COUNTS[4].load(Ordering::Relaxed),
+            "Relay Next R13d parallel card preparation statistics");
+    }
+}
+
+fn merged_card_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.sort_unstable();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for (from, to) in ranges {
+        match spans.last_mut() {
+            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => spans.push((from, to)),
+        }
+    }
+    spans
 }
 
 /// Whether a host list's prelude is made when the list first needs one. A
@@ -2597,6 +2642,9 @@ struct CardPlan {
     /// R12b reserves the closed compare list before submission, then
     /// records it only after the preceding render batches are queued.
     check_pending: bool,
+    /// R13d: a reserved compare list being recorded by a prep worker.
+    /// Consumed at its existing ExecuteCommandLists boundary.
+    check_ready: Mutex<Option<PreludeDone>>,
     /// The copies whose card side was brought up to date, alive until the
     /// submission has run.
     _synced: Vec<std::sync::Arc<crate::shadow::Shadow>>,
@@ -5057,6 +5105,26 @@ impl Host {
                 }
             }
         }
+        // Normalize the declared compare ranges while the ordered lane
+        // records and submits the upload/hash list. No title bytes or
+        // mutable shadow state are touched by this job.
+        let range_ready = if !flown && next_card_prep()
+            && declared.iter().map(|(_, ranges)| ranges.len()).sum::<usize>() >= 32
+        {
+            let input: Vec<_> = declared.iter().map(|(_, ranges)| ranges.clone()).collect();
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let job: PreludeJob = Box::new(move || {
+                let spans: Vec<_> = input.into_iter().map(merged_card_ranges).collect();
+                let _ = tx.send(spans);
+            });
+            if next_try_prep(job).is_ok() {
+                next_card_prep_stat(0, 1);
+                Some(rx)
+            } else {
+                next_card_prep_stat(4, 1);
+                None
+            }
+        } else { None };
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         let mut looks = None;
         // The bytes as they are now, whatever later submissions put there.
@@ -5217,6 +5285,7 @@ impl Host {
             ranges: Vec::new(),
             check: None,
             check_pending: false,
+            check_ready: Mutex::new(None),
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
             sent_as,
@@ -5226,16 +5295,17 @@ impl Host {
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
         let mut at = if plan.next_snapshot.is_some() { 0 } else { work.taken };
+        let mut prepared_ranges = range_ready.map(|ready| {
+            let began = std::time::Instant::now();
+            let spans = ready.recv().unwrap_or_else(|_| fail(format_args!("Relay Next R13d range preparation failed")));
+            next_card_prep_stat(2, began.elapsed().as_micros() as u64);
+            spans.into_iter()
+        });
         for (shadow, ranges) in &declared {
-            let mut sorted = ranges.clone();
-            sorted.sort_unstable();
-            let mut spans: Vec<(usize, usize)> = Vec::new();
-            for (from, to) in sorted {
-                match spans.last_mut() {
-                    Some(last) if from <= last.1 => last.1 = last.1.max(to),
-                    _ => spans.push((from, to)),
-                }
-            }
+            let spans = match prepared_ranges.as_mut() {
+                Some(prepared) => prepared.next().expect("R13d ordered range plan"),
+                None => merged_card_ranges(ranges.clone()),
+            };
             let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
             for (from, to) in spans {
                 let Some(span) = shadow.card_span(from, to) else {
@@ -5294,6 +5364,10 @@ impl Host {
                 Ok(list) => {
                     plan.check = Some(list);
                     plan.check_pending = defer;
+                    if defer && next_card_prep() {
+                        *plan.check_ready.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Self::start_card_compare(work, &plan, &check);
+                    }
                 }
                 Err(e) => fail(format_args!("the compare of host copies in the card's memory could not be prepared ({e})")),
             }
@@ -5346,6 +5420,67 @@ impl Host {
         recorded
     }
 
+    /// R13d: record the existing trailing compare on the prep pool.
+    /// Capture immutable dispatch arguments and COM references while
+    /// still on the ordered lane. The worker never takes CARD_WORK,
+    /// accesses a mapped buffer, or submits to a GPU queue.
+    fn start_card_compare(work: &CardWork, plan: &CardPlan, check: &Prelude) -> Option<PreludeDone> {
+        let packed = plan.next_snapshot.as_ref().is_some_and(|s| s.packed);
+        let dispatches: Vec<_> = plan.ranges.iter().filter(|r| r.compared).filter_map(|r| {
+            let (_, before, _) = r.shadow.card_sides()?;
+            Some((r.shadow.buffer.clone(), before?, r.span, r.shadow.card_hash_size() as u32,
+                r.at, if !r.picked && packed { 3 } else { 1 }))
+        }).collect();
+        if dispatches.is_empty() { return None; }
+        let root = work.root.clone();
+        let pso = work.pso.clone();
+        let results = plan.next_snapshot.as_ref().map_or(&work.differs, |s| &s.differs).0.clone();
+        let (allocator, list) = (check.0.clone(), check.1.clone());
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let job: PreludeJob = Box::new(move || {
+            // SAFETY: reserved allocator/list pair; no queue execution
+            // until the ordered lane joins this job. All buffers live.
+            let recorded = unsafe {
+                (|| -> windows::core::Result<()> {
+                    allocator.Reset()?;
+                    list.Reset(&allocator, None)?;
+                    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                                pResource: std::mem::ManuallyDrop::new(None),
+                            }),
+                        },
+                    }]);
+                    list.SetComputeRootSignature(&root);
+                    list.SetPipelineState(&pso);
+                    list.SetComputeRootUnorderedAccessView(3, results.GetGPUVirtualAddress());
+                    for (buffer, before, span, size, at, mode) in dispatches {
+                        list.SetComputeRootShaderResourceView(1, buffer.GetGPUVirtualAddress());
+                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                        card_pass(&list, &span, size, at, mode);
+                        CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                    }
+                    list.Close()
+                })()
+            };
+            if let Err(e) = recorded {
+                fail(format_args!("Relay Next R13d compare recording failed ({e})"));
+            }
+            let _ = tx.send(());
+        });
+        if next_try_prep(job).is_ok() {
+            next_card_prep_stat(1, 1);
+            Some(rx)
+        } else {
+            // Do not wait for capacity. R12b records at its original
+            // boundary when the pool cannot accept another job.
+            next_card_prep_stat(4, 1);
+            None
+        }
+    }
+
     /// The reserved list must be closed before submitting the group that
     /// contains it. Only its CPU-side command recording is deferred; no
     /// title memory is read and no CPU-visible completion is published.
@@ -5356,6 +5491,13 @@ impl Host {
             completed != u64::MAX && completed < target
         });
         let busy = pending();
+        if let Some(ready) = plan.check_ready.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            if ready.recv().is_err() {
+                fail(format_args!("Relay Next R13d compare worker failed"));
+            }
+            next_card_prep_stat(3, began.elapsed().as_micros() as u64);
+            return;
+        }
         let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let work = work.as_ref().expect("R12b live comparison work");
         let check = plan.lists.iter().find(|(compare, _)| *compare).map(|(_, list)| list)
