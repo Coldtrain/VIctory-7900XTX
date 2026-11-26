@@ -3018,6 +3018,29 @@ pub(crate) fn next_drain() {
     }
 }
 
+/// Nonblocking GPU completion check on the submission lane. The actual
+/// retirement and title signal publication remain ordered under submitted.
+pub(crate) fn next_poll() {
+    if !next_flight_pending() { return; }
+    let Some(host) = host() else { return; };
+    let mut submitted = match host.submitted.try_lock() {
+        Ok(lock) => lock,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    let target = next_flight_slot().as_ref().map(|flight| flight.fence);
+    let Some(target) = target else { return; };
+    let completed = unsafe { host.fence.GetCompletedValue() };
+    if completed == u64::MAX || completed >= target {
+        host.next_drain_locked(&mut submitted);
+        drop(submitted);
+        land();
+        crate::relay_next::persistent_stats(1);
+    } else {
+        crate::relay_next::persistent_stats(0);
+    }
+}
+
 /// The submission lock protects both the pending recording and its
 /// ordered signals. Bound their count, falling back to the normal drain.
 pub(crate) fn next_defer_signal(fence: usize, value: u64) -> bool {

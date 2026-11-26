@@ -85,6 +85,10 @@ pub(super) trait Work: Send {
     /// Flush independently submitted work before acknowledging a look.
     fn flush() {}
     fn pending() -> bool { false }
+    // The default for test and legacy lanes is still to drain every look.
+    fn persist() -> bool { false }
+    fn poll() { Self::flush(); }
+    fn explicit_drain() { Self::flush(); }
     /// Does it. `forced`: its wait was not met.
     fn go(self, forced: bool);
 }
@@ -107,6 +111,9 @@ struct State<W> {
     /// whole look has followed.
     asked: u64,
     served: u64,
+    // Highest look ticket for which a caller explicitly requires visibility.
+    // Ordinary push/wake requests must not acknowledge it prematurely.
+    drain_through: u64,
     /// Presents and submissions in the line or being done.
     presents: usize,
     runs: usize,
@@ -130,6 +137,7 @@ impl<W: Work> Lane<W> {
                 running: Vec::new(),
                 asked: 0,
                 served: 0,
+                drain_through: 0,
                 presents: 0,
                 runs: 0,
             }),
@@ -199,6 +207,7 @@ impl<W: Work> Lane<W> {
         }
         state.asked += 1;
         let ticket = state.asked;
+        state.drain_through = ticket;
         self.work.notify_one();
         while state.served < ticket {
             state = self.moved.wait(state).unwrap_or_else(|e| e.into_inner());
@@ -225,10 +234,10 @@ impl<W: Work> Lane<W> {
     /// Looks at the line for as long as the process runs.
     fn serve(&self) -> ! {
         loop {
-            let (asked, limit) = {
+            let (asked, limit, explicit) = {
                 let mut state = self.lock();
                 while state.asked == state.served {
-                    if state.items.is_empty() {
+                    if state.items.is_empty() && !(W::persist() && W::pending()) {
                         state = self.work.wait(state).unwrap_or_else(|e| e.into_inner());
                     } else {
                         // It stands at something the CPU may write without
@@ -241,9 +250,22 @@ impl<W: Work> Lane<W> {
                         }
                     }
                 }
-                (state.asked, state.next)
+                (state.asked, state.next, state.drain_through > state.served)
             };
-            self.look(limit);
+            if W::persist() {
+                while self.step(limit) {}
+                // An explicit drain is acknowledged only after visibility.
+                // Otherwise leave the ticket owned across scheduling looks;
+                // the timed idle wake above ensures eventual retirement
+                // even if the title never queues another job.
+                if explicit {
+                    W::explicit_drain();
+                } else {
+                    W::poll();
+                }
+            } else {
+                self.look(limit);
+            }
             let mut state = self.lock();
             state.served = state.served.max(asked);
             drop(state);
@@ -593,6 +615,15 @@ impl Work for Job {
         crate::host::next_flight_pending()
     }
 
+    fn persist() -> bool { crate::relay_next::persistent_flights() }
+
+    fn poll() { crate::host::next_poll(); }
+
+    fn explicit_drain() {
+        if Self::pending() { crate::relay_next::persistent_stats(2); }
+        Self::flush();
+    }
+
     fn go(self, forced: bool) {
         // A signal can follow the earlier GPU fence without blocking
         // the lane here. Waits, presents and all other visibility points
@@ -601,7 +632,13 @@ impl Work for Job {
             Job::Signal(fence, value) => crate::host::next_defer_signal(*fence, *value),
             _ => false,
         };
-        if !held_signal && !matches!(&self, Job::Run(..) | Job::Joined(..)) {
+        // A non-forced wait already met by the title's actual fence
+        // has no work to execute. Do not drain an unrelated read-only
+        // flight simply because this queue's satisfied wait was visited.
+        let satisfied = crate::relay_next::persistent_flights() && !forced
+            && matches!(&self, Job::Wait(f, v) if crate::fence::completed(*f as This) >= *v);
+        if satisfied && Self::pending() { crate::relay_next::persistent_stats(3); }
+        if !held_signal && !satisfied && !matches!(&self, Job::Run(..) | Job::Joined(..)) {
             crate::host::next_drain();
         }
         let began = Instant::now();

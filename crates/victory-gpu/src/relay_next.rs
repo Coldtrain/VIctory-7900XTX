@@ -240,6 +240,26 @@ pub(crate) fn signal_stats(kind: usize, n: u64) {
     }
 }
 
+/// R12e: a normal scheduler look does not mean CPU visibility is
+/// required. Keep a read-only flight across looks until its fence,
+/// an explicit drain, or a true dependency.
+pub(crate) fn persistent_flights() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| ordered_signals() && std::env::var_os("VICTORY_RELAY_NEXT_PERSISTENT_FLIGHTS").is_some_and(|v| v == "1"))
+}
+
+pub(crate) fn persistent_stats(kind: usize) {
+    static COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    let n = COUNTS[kind].fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(256) || trace() {
+        tracing::info!(look_survivals = COUNTS[0].load(Ordering::Relaxed),
+            completed_polls = COUNTS[1].load(Ordering::Relaxed),
+            explicit_drains = COUNTS[2].load(Ordering::Relaxed),
+            satisfied_waits = COUNTS[3].load(Ordering::Relaxed),
+            "Relay Next R12e persistent flight statistics");
+    }
+}
+
 /// Counts the independent path separately from R12a's grouped tickets.
 pub(crate) fn flight_stats(kind: usize) {
     static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
