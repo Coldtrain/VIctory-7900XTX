@@ -415,6 +415,14 @@ pub(crate) fn disjoint_pages(mut ranges: Vec<(usize, usize)>) -> bool {
     ranges.windows(2).all(|w| (w[0].1 - 1) / 4096 < w[1].0 / 4096)
 }
 
+/// Scan completed, independent mappings while the ordered lane handles
+/// card readbacks. CPU-visible writes stay on the lane.
+pub(crate) fn overlap_scan() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| (scheduler() || parallel_landing()) && snapshots()
+        && std::env::var_os("VICTORY_RELAY_NEXT_OVERLAP_SCAN").is_none_or(|v| v != "0"))
+}
+
 type ScanWork = Vec<(Arc<crate::shadow::Shadow>, usize, usize)>;
 type ScanResult = Vec<Vec<(usize, usize)>>;
 type ScanJob = (ScanWork, std::sync::mpsc::SyncSender<ScanResult>);
@@ -422,7 +430,7 @@ type ScanJob = (ScanWork, std::sync::mpsc::SyncSender<ScanResult>);
 /// Read-only comparison on a persistent worker while the submitting thread
 /// fetches the carded copies. No title writes are moved into this worker.
 pub(crate) fn start_scan(work: ScanWork) -> Option<std::sync::mpsc::Receiver<ScanResult>> {
-    if !parallel_landing() || work.is_empty() { return None; }
+    if !overlap_scan() || work.is_empty() { return None; }
     static WORKER: OnceLock<Option<std::sync::mpsc::SyncSender<ScanJob>>> = OnceLock::new();
     let worker = WORKER.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::sync_channel::<ScanJob>(1);
@@ -441,7 +449,7 @@ pub(crate) fn start_scan(work: ScanWork) -> Option<std::sync::mpsc::Receiver<Sca
         }
     }).as_ref()?;
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    worker.send((work, tx)).unwrap_or_else(|_| crate::host::fail(format_args!("Relay Next scan worker disconnected")));
+    worker.try_send((work, tx)).ok()?;
     Some(rx)
 }
 

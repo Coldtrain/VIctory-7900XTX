@@ -4670,7 +4670,61 @@ fn back_scan_work(back: &[Declared]) -> Vec<(std::sync::Arc<crate::shadow::Shado
     work
 }
 
-type NextScan = (Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>, std::sync::mpsc::Receiver<Vec<Vec<(usize, usize)>>>);
+type ScanRange = (std::sync::Arc<crate::shadow::Shadow>, usize, usize);
+
+struct NextScan {
+    work: Vec<ScanRange>,
+    independent: Vec<usize>,
+    ready: std::sync::mpsc::Receiver<Vec<Vec<(usize, usize)>>>,
+}
+
+/// Sort and merge the page intervals once. A scan that intersects a
+/// card write stays on the ordered lane until that write is visible.
+fn next_scan(back: &[Declared], card: &CardPlan) -> Option<NextScan> {
+    let mut pages = Vec::new();
+    for range in card.ranges.iter().filter(|r| !r.picked) {
+        let (lo, hi) = range.declared;
+        if hi <= lo { return None; }
+        pages.push((lo / 4096, (hi - 1) / 4096 + 1));
+    }
+    if pages.is_empty() { return None; }
+    let pages = merged_card_ranges(pages);
+    let work = back_scan_work(back);
+    let independent: Vec<usize> = work.iter().enumerate().filter_map(|(i, (shadow, lo, hi))| {
+        if shadow.in_place() || lo >= hi { return None; }
+        let at = pages.partition_point(|&(_, end)| end <= lo / 4096);
+        pages.get(at).is_none_or(|&(start, _)| start > (hi - 1) / 4096).then_some(i)
+    }).collect();
+    if independent.is_empty() { return None; }
+    let ready = crate::relay_next::start_scan(independent.iter().map(|&i| work[i].clone()).collect())?;
+    static SCANS: AtomicU64 = AtomicU64::new(0);
+    let scans = SCANS.fetch_add(1, Ordering::Relaxed) + 1;
+    if scans == 1 || scans.is_multiple_of(256) {
+        tracing::info!(scans, offloaded = independent.len(), total = work.len(),
+            "Relay Next overlapped readback scan");
+    }
+    Some(NextScan { work, independent, ready })
+}
+
+impl NextScan {
+    fn finish(self) -> (Vec<ScanRange>, Vec<Vec<(usize, usize)>>) {
+        let mut indices = self.independent.iter().copied().peekable();
+        let mut delayed = Vec::new();
+        for (i, range) in self.work.iter().enumerate() {
+            if indices.next_if_eq(&i).is_none() { delayed.push(range.clone()); }
+        }
+        let mut later = crate::shadow::find_all(&delayed).into_iter();
+        let scanned = self.ready.recv().unwrap_or_else(|_| fail(format_args!("Relay Next scan worker failed")));
+        assert_eq!(scanned.len(), self.independent.len());
+        let mut early = scanned.into_iter();
+        let mut indices = self.independent.into_iter().peekable();
+        // Reassemble in original declaration order before any title writes.
+        let found = (0..self.work.len()).map(|i| {
+            if indices.next_if_eq(&i).is_some() { early.next().unwrap() } else { later.next().unwrap() }
+        }).collect();
+        (self.work, found)
+    }
+}
 
 fn hand_back(back: &[Declared]) {
     hand_back_scanned(back, None);
@@ -4682,12 +4736,8 @@ fn hand_back_scanned(back: &[Declared], scan: Option<NextScan>) {
         // threads), then the merges, in order, as below.
         #[cfg(feature = "diagnostics")]
         let scanning = std::time::Instant::now();
-        let (work, found) = if let Some((work, scan)) = scan {
-            let found = scan.recv().unwrap_or_else(|_| fail(format_args!("Relay Next scan failed before CPU visibility")));
-            if found.len() != work.len() {
-                fail(format_args!("Relay Next scan returned incomplete results"));
-            }
-            (work, found)
+        let (work, found) = if let Some(scan) = scan {
+            scan.finish()
         } else {
             let work = back_scan_work(back);
             let found = crate::shadow::find_all(&work);
@@ -7415,19 +7465,8 @@ impl Host {
         let back = crate::picked::with(declared, &picked.written);
         // The scanner reads only completed non-carded GPU mappings and
         // snapshots. A card merge must not touch any of its title pages.
-        let scan = if crate::relay_next::parallel_landing() && crate::shadow::wide_back() {
-            if let Some(plan) = &card {
-                let work = back_scan_work(&back);
-                let card_ranges: Vec<_> = plan.ranges.iter().filter(|r| !r.picked)
-                    .map(|r| r.declared).collect();
-                let safe = !work.is_empty() && !card_ranges.is_empty()
-                    && work.iter().all(|(s, lo, hi)| !s.in_place() && lo < hi &&
-                        card_ranges.iter().all(|&(a,b)| a < b &&
-                            ((*hi - 1) / 4096 < a / 4096 || (b - 1) / 4096 < *lo / 4096)));
-                if safe {
-                    crate::relay_next::start_scan(work.clone()).map(|rx| (work, rx))
-                } else { None }
-            } else { None }
+        let scan = if crate::relay_next::overlap_scan() && crate::shadow::wide_back() {
+            card.as_ref().and_then(|plan| next_scan(&back, plan))
         } else { None };
         if let Some(card) = &card {
             self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
