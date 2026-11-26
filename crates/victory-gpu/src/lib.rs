@@ -37,6 +37,11 @@ pub mod dxgi;
 pub mod external;
 pub mod fence;
 pub mod frame;
+
+/// Number of title frame beginnings, for timing diagnostics.
+pub fn frames_begun() -> u64 {
+    frame::current()
+}
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
 #[cfg(windows)]

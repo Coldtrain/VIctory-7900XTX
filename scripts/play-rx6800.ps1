@@ -19,6 +19,10 @@ $settings = @{
     # Port of the NVIDIA fork's resolution-only settings; no GPU vendor changes.
     #VICTORY_RENDER_SCALE = '0.20'
     VICTORY_OWN_UPSCALER = '1'
+    # Sprint 14a: match title and frame clock at 60 Hz; diagnostics for slow simulation.
+    VICTORY_FRAME_INTERVAL_MS = '16.667'
+    VICTORY_TITLE_FPS = '60'
+    VICTORY_TIMER_LOG = '1'
     VICTORY_RELAY = '0'
     VICTORY_LATE_WAIT = '0'
     VICTORY_RELAY_COPY = '0'
@@ -104,6 +108,8 @@ if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }
 foreach ($name in $More.Keys) { $settings[$name] = $More[$name] }
 $console = 'series-s'
 if ($settings.VICTORY_FSR_4K -and $settings.VICTORY_FSR_4K -ne '0') {
+    # Do not compound the separate experimental FSR path with new timing.
+    if (-not $More.ContainsKey('VICTORY_FRAME_INTERVAL_MS')) { $settings.VICTORY_FRAME_INTERVAL_MS = '' }
     $console = 'series-x'
     $settings.VICTORY_OWN_UPSCALER = '0'
     $settings.VICTORY_RENDER_SCALE = '0'
