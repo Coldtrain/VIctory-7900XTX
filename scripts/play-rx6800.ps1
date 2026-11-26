@@ -39,9 +39,11 @@ $settings = @{
     VICTORY_PORT_CBV = '0'
     VICTORY_PORT_GUARD = '1'
     VICTORY_PORT_JOURNAL = '1'
+    VICTORY_PORT_TEXTURE_PRELUDE = '1' # Belobug submission-time uploads (Relay 0)
 }
 
 if ($RNext) {
+    $settings.VICTORY_PORT_TEXTURE_PRELUDE = '0'
     $settings.VICTORY_RELAY_NEXT = '2'
     $settings.VICTORY_RELAY_NEXT_SNAPSHOTS = '1'
     $settings.VICTORY_RELAY_NEXT_MERGE = '0'
