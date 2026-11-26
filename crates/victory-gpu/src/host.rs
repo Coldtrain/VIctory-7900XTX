@@ -494,11 +494,19 @@ fn bury(finished: u64) {
     let finished = finished.saturating_sub(bury_lag());
     let done: Vec<(u64, Retired)> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
-        let n = retired.iter().take_while(|(at, _)| *at <= finished).count();
-        if n == 0 {
-            return;
+        // Producers can enqueue out of submission order. An ineligible
+        // entry must not pin all eligible objects behind it.
+        let mut done = Vec::new();
+        let mut pending = std::collections::VecDeque::new();
+        while let Some(entry) = retired.pop_front() {
+            if entry.0 <= finished {
+                done.push(entry);
+            } else {
+                pending.push_back(entry);
+            }
         }
-        retired.drain(..n).collect()
+        *retired = pending;
+        done
     };
     drop(done);
 }
