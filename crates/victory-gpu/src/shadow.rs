@@ -119,6 +119,8 @@ struct Card {
     /// Offsets of the copy whose bytes changed on the CPU's side and have
     /// not gone to the card's side yet.
     dirty: Mutex<Vec<(usize, usize)>>,
+    /// Already GPU-resident bytes whose comparison hash needs refreshing.
+    rehash: Mutex<Vec<(usize, usize)>>,
     /// With [`relay`]: the offsets that went from `dirty` to the card's
     /// side, each with the number of the send that took it
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
@@ -609,7 +611,7 @@ impl SentRuns {
 /// that send knows the card did not hold these bytes yet
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
-pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+pub(crate) fn card_dirty(sent_as: u64, rehash: &mut Vec<(Arc<Shadow>, Vec<(usize, usize)>)>) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
     let mut out = Vec::new();
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
@@ -624,6 +626,10 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
             .map(|c| {
                 let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
                 let ranges = joined(std::mem::take(&mut *dirty));
+                let hashes = joined(std::mem::take(&mut *c.rehash.lock().unwrap_or_else(|e| e.into_inner())));
+                if !hashes.is_empty() {
+                    rehash.push((shadow.clone(), hashes));
+                }
                 if relay() {
                     let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
                     sent.forget(fetched);
@@ -4107,6 +4113,15 @@ impl Shadow {
         self.card_changed_runs(std::iter::once((from, to)));
     }
 
+    /// Mark bytes already present on the GPU for hash refresh only.
+    /// Never remove existing CPU-dirty ranges: a genuine CPU write wins.
+    fn card_rehash_only(&self, from: usize, to: usize) {
+        let Some(card) = &self.card else { return; };
+        let _dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        card.rehash.lock().unwrap_or_else(|e| e.into_inner()).push((from, to));
+        card.touched.store(true, Ordering::Release);
+    }
+
     /// [`Shadow::card_changed`] of each of `runs`.
     fn card_changed_runs(&self, runs: impl Iterator<Item = (usize, usize)>) {
         let Some(card) = &self.card else {
@@ -4337,8 +4352,21 @@ impl Shadow {
             // card wrote, as before.
             old.copy_from_slice(gpu);
         }
-        // The card's side and its "before" take the result.
-        self.card_changed(at, at + n);
+        // Preserve the exact same CPU-visible merge. If its result is
+        // already on the card, only the hash needs refreshing before the
+        // next submission. A CPU-modified byte still requires upload.
+        if crate::host::next_resident_rehash()
+            && old == gpu
+            && self.card.as_ref().is_some_and(|c| c.before.lock().unwrap_or_else(|e| e.into_inner()).is_some())
+        {
+            self.card_rehash_only(at, at + n);
+            crate::relay_next::resident_stats(n as u64, true);
+        } else {
+            self.card_changed(at, at + n);
+            if crate::host::next_resident_rehash() {
+                crate::relay_next::resident_stats(n as u64, false);
+            }
+        }
         written
     }
 
@@ -4419,6 +4447,7 @@ impl Shadow {
                 staging: none(),
                 before: Mutex::default(),
                 dirty: Mutex::default(),
+                rehash: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),
                 size: len.next_multiple_of(PIECE as u64),
@@ -4575,6 +4604,7 @@ mod land_tests {
             staging: buffer,
             before: Mutex::default(),
             dirty: Mutex::default(),
+            rehash: Mutex::default(),
             sent: Mutex::default(),
                 touched: Default::default(),
             size: len as u64,
@@ -4990,6 +5020,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     staging: buffer,
                     before: Mutex::default(),
                     dirty: Mutex::default(),
+                    rehash: Mutex::default(),
                     sent: Mutex::default(),
                 touched: Default::default(),
                     size,
@@ -5218,6 +5249,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         staging,
         before: Mutex::default(),
         dirty: Mutex::default(),
+        rehash: Mutex::default(),
         sent: Mutex::default(),
         touched: Default::default(),
         size: len,
@@ -5307,6 +5339,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 staging: buffer,
                 before: Mutex::default(),
                 dirty: Mutex::default(),
+                rehash: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),
                 size: len,
