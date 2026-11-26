@@ -679,7 +679,7 @@ static DESCRIPTOR_HORIZON: Mutex<u64> = Mutex::new(0);
 
 pub(crate) fn descriptor_fence_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| relay_exact() && std::env::var_os("VICTORY_DESCRIPTOR_FENCE").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| crate::relay_next::paired() || (relay_exact() && std::env::var_os("VICTORY_DESCRIPTOR_FENCE").is_none_or(|v| v != "0")))
 }
 
 pub(crate) fn descriptor_publication(host: &Host) -> Option<std::sync::MutexGuard<'static, u64>> {
@@ -5707,7 +5707,7 @@ impl Host {
         let mut next_ticket = crate::relay_next::enabled().then(|| crate::relay_next::Ticket::new(this_submission));
         if let Some(ticket) = next_ticket.as_mut() {
             if late {
-                fail(format_args!("Relay Next R2 cannot use legacy late submission"));
+                fail(format_args!("Relay Next R3 cannot use legacy late submission"));
             }
             for list in runs {
                 ticket.claim(&list.next_lease);
@@ -5943,6 +5943,18 @@ impl Host {
             working(was_working);
             return Some((submitted, sent));
         }
+        // R3: pair the title render batch with its trailing card compare.
+        // Do not split arbitrary title lists: their state assumptions may
+        // depend on sharing an ExecuteCommandLists boundary. No next title
+        // submission is prepared before both batches and readbacks finish.
+        let compare_cut = if crate::relay_next::paired() {
+            card.as_ref().and_then(|c| c.check.as_ref())
+                .and_then(|check| lists.iter().position(|l| l.as_ref() == Some(check)))
+                .filter(|&i| i > 0 && i < lists.len())
+        } else { None };
+        #[cfg(feature = "diagnostics")]
+        let compare_cut = if timing() { None } else { compare_cut };
+        let paired_batches = compare_cut.is_some();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
         let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
@@ -5951,11 +5963,17 @@ impl Host {
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
                 .map(|(&a, &b)| &lists[a..b])
                 .collect()
+        } else if let Some(cut) = compare_cut {
+            vec![&lists[..cut], &lists[cut..]]
         } else {
             vec![&lists[..]]
         };
         #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if let Some(cut) = compare_cut {
+            vec![&lists[..cut], &lists[cut..]]
+        } else {
+            vec![&lists[..]]
+        };
         if let Some(ticket) = next_ticket.as_mut() {
             for list in runs {
                 list.next_pin(ticket);
@@ -5971,19 +5989,32 @@ impl Host {
             }
         }
         submitting(2, runs.len());
+        let mut next_descriptor_horizon = None;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
             if let Some(ticket) = next_ticket.as_mut() {
-                ticket.send(&self.device, &self.queue, &self.fence, self.event, *submitted, group, || self.card_sent());
+                // Block staged visible descriptor updates while both batches
+                // are queued. Publish the last fence before releasing the
+                // gate so writers cannot overwrite a live GPU descriptor.
+                if crate::relay_next::paired() && next_descriptor_horizon.is_none() {
+                    next_descriptor_horizon = Some(DESCRIPTOR_HORIZON.lock().unwrap_or_else(|e| e.into_inner()));
+                }
+                ticket.send(&self.device, &self.queue, &self.fence, *submitted, group, paired_batches, || self.card_sent());
+                if let Some(horizon) = next_descriptor_horizon.as_mut() {
+                    **horizon = *submitted;
+                }
                 #[cfg(feature = "diagnostics")]
                 crate::timeline::sent(sending, *submitted, stamp);
-                working(false);
-                #[cfg(feature = "diagnostics")]
-                let _card = crate::timeline::card_wait(Some(*submitted));
-                ticket.wait(&self.device, &self.fence, self.event);
-                stood(started);
-                working(true);
+                if !paired_batches || i + 1 == groups.len() {
+                    drop(next_descriptor_horizon.take());
+                    working(false);
+                    #[cfg(feature = "diagnostics")]
+                    let _card = crate::timeline::card_wait(Some(*submitted));
+                    ticket.wait(&self.device, &self.fence, self.event);
+                    stood(started);
+                    working(true);
+                }
             } else {
             let mut descriptor_horizon = descriptor_fence_on().then(|| DESCRIPTOR_HORIZON.lock().unwrap_or_else(|e| e.into_inner()));
             // SAFETY: closed lists; the fence and event are ours.
