@@ -2463,9 +2463,6 @@ pub(crate) fn next_card_piece_bytes() -> usize {
     if next_resident_rehash() { crate::relay_next::readback_piece_bytes() } else { 65536 }
 }
 
-// R7b: one bounded, private export arena per synchronous card plan.
-const NEXT_PACK_BUDGET: u64 = 16 << 20;
-
 #[derive(Clone, Copy)]
 struct NextPackLayout {
     results: u64,
@@ -2478,7 +2475,8 @@ impl NextPackLayout {
     fn new(results: u64, grid: usize) -> Self {
         // Hashes widen an unaligned piece to 16-byte boundaries.
         let stride = grid as u64 + 16;
-        Self { results, stride, payload: results * 2 + 16, slots: NEXT_PACK_BUDGET / stride }
+        let budget = crate::relay_next::packed_readback_bytes();
+        Self { results, stride, payload: results * 2 + 16, slots: budget / stride }
     }
     fn bytes(self) -> u64 { self.payload + self.slots * self.stride }
     fn counter(self) -> u64 { self.results * 2 }
@@ -5240,7 +5238,9 @@ impl Host {
                 let fetch = self.make_prelude().unwrap_or_else(||
                     fail(format_args!("Relay Next: cannot allocate private fetch command list")));
                 name(&buffer, || "Relay Next private comparison results".into());
-                tracing::info!(bytes, packed, "Relay Next: private snapshot storage allocated");
+                tracing::info!(bytes, packed,
+                    packed_capacity_mb = crate::relay_next::packed_readback_bytes() >> 20,
+                    "Relay Next: private snapshot storage allocated");
                 NextSnapshot { differs: (buffer, data as usize, bytes), fetch, fetched: Mutex::new(None), packed }
             }))
         } else { None };

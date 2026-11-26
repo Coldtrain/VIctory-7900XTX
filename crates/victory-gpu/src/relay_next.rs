@@ -352,6 +352,19 @@ pub(crate) fn packed_readback() -> bool {
     *ON.get_or_init(|| snapshots() && std::env::var_os("VICTORY_RELAY_NEXT_PACKED_READBACK").is_some_and(|v| v == "1"))
 }
 
+/// Capacity of each private packed export arena. The previous fixed 16 MiB
+/// capacity overflowed on frames known to copy back about 86 MiB, forcing a
+/// second command submission and fence wait for the overflow. Keep a bounded
+/// override for cards and system-memory budgets which prefer a smaller arena.
+pub(crate) fn packed_readback_bytes() -> u64 {
+    static BYTES: OnceLock<u64> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("VICTORY_RELAY_NEXT_PACKED_MB").ok()
+            .and_then(|v| v.parse::<u64>().ok()).unwrap_or(96)
+            .clamp(16, 256) << 20
+    })
+}
+
 pub(crate) fn packed_stats(hit: bool, pieces: usize, bytes: u64) {
     static CALLS: AtomicU64 = AtomicU64::new(0);
     static AVOIDED: AtomicU64 = AtomicU64::new(0);
