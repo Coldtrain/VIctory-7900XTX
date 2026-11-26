@@ -41,6 +41,7 @@ $settings = @{
     VICTORY_PORT_CBV_RAW16 = '0'
     VICTORY_PORT_AMD_TEXTURE_BUDGET = '1' # Sprint 12a: adaptive mip and VRAM policy
     VICTORY_PORT_AMD_BATCH_POOL = '1' # Sprint 12b: shared indirect argument buffers
+    VICTORY_PORT_AMD_PROBE_FILTER = '1' # Sprint 12c: filter suspect magenta ambient probes
     VICTORY_PORT_GUARD = '1'
     VICTORY_PORT_JOURNAL = '1'
     VICTORY_PORT_TEXTURE_PRELUDE = '1' # Belobug submission-time uploads (Relay 0)

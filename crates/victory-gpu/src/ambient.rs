@@ -321,6 +321,10 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     float3 was = unpack(light[p]);
+#ifdef AMD_PROBE_FILTER
+    // Belobug e9428969: discard suspect magenta lighting probes.
+    if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
+#endif
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
     float top = max(dot(found, LUMA) * most, 1e-6);
@@ -354,8 +358,11 @@ unsafe impl Sync for Pass {}
 
 fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -> windows::core::Result<Pass> {
     let mut root: Option<ID3D12RootSignature> = None;
+    let filter = std::env::var_os("VICTORY_PORT_AMD_PROBE_FILTER").is_some_and(|v| v == "1");
+    tracing::info!(enabled = filter, "Belobug ambient probe filter (VICTORY_PORT_AMD_PROBE_FILTER)");
+    let define = if filter { "#define AMD_PROBE_FILTER 1\n" } else { "" };
     let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
-        let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
+        let code = crate::host::compile(&format!("#define {part}\n{define}{SOURCE}"), entry, s!("cs_5_1"))?;
         // SAFETY: the root signature is inside the shader; plain creations.
         unsafe {
             if root.is_none() {
