@@ -5638,9 +5638,22 @@ impl Host {
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 let mut from = 0;
-                for to in cuts.into_iter().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
+                // Buffer state decay occurs at ExecuteCommandLists boundaries,
+                // not between lists in one call. The hash comparison binds
+                // title buffers as SRVs, including buffers just copied to.
+                let separate_compare = relay() && card.as_ref().is_some_and(|c| c.check.is_some());
+                let end = if separate_compare {
+                    let check = card.as_ref().and_then(|c| c.check.as_ref()).unwrap();
+                    lists.iter().position(|l| l.as_ref() == Some(check)).unwrap_or(lists.len())
+                } else { lists.len() };
+                for to in cuts.into_iter().filter(|&to| to < end).chain([end]) {
+                    if from < to {
+                        self.queue.ExecuteCommandLists(&lists[from..to]);
+                    }
                     from = to;
+                }
+                if separate_compare {
+                    self.queue.ExecuteCommandLists(&lists[end..]);
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
