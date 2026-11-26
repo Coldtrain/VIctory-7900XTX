@@ -72,6 +72,10 @@ unsafe impl Sync for Host {}
 /// runs a submission: freeing there is a GPU page fault on the freed
 /// texture (a device hang).
 static RETIRED: Mutex<std::collections::VecDeque<(u64, Retired)>> = Mutex::new(std::collections::VecDeque::new());
+// One retained COM reference per resource is enough to keep it alive.
+// Repeated descriptor replacement extends its retirement horizon.
+static RETIRED_RESOURCES: Mutex<std::collections::BTreeMap<usize, (u64, ID3D12Resource)>> =
+    Mutex::new(std::collections::BTreeMap::new());
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -80,8 +84,6 @@ static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 #[allow(dead_code)]
 enum Retired {
     Any(Box<dyn std::any::Any>),
-    /// What a descriptor slot showed: 20,000 a frame, without a box each.
-    Resource(ID3D12Resource),
 }
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the
 // reference-counted wrappers holding them, dropped once.
@@ -473,7 +475,19 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
+    let key = object.as_raw() as usize;
+    let mut resources = RETIRED_RESOURCES.lock().unwrap_or_else(|e| e.into_inner());
+    match resources.entry(key) {
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            entry.get_mut().0 = entry.get().0.max(started);
+            drop(resources);
+            // The existing reference keeps the very same resource alive.
+            drop(object);
+        }
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert((started, object));
+        }
+    }
 }
 
 /// How many submissions later than it could (the last one that may use it
@@ -506,10 +520,18 @@ fn bury(finished: u64) {
             }
         }
         *retired = pending;
-        relay_trace(|| format!("retire cutoff={finished} releasing={} pending={}", done.len(), retired.len()));
+        relay_trace(|| format!("retire wrappers cutoff={finished} releasing={} pending={}", done.len(), retired.len()));
         done
     };
     drop(done);
+    let done_resources = {
+        let mut resources = RETIRED_RESOURCES.lock().unwrap_or_else(|e| e.into_inner());
+        let eligible: Vec<usize> = resources.iter().filter_map(|(&key, (at, _))| (*at <= finished).then_some(key)).collect();
+        let done: Vec<_> = eligible.into_iter().filter_map(|key| resources.remove(&key)).collect();
+        relay_trace(|| format!("retire resources cutoff={finished} releasing={} pending_unique={}", done.len(), resources.len()));
+        done
+    };
+    drop(done_resources);
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
