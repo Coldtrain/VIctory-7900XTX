@@ -69,7 +69,7 @@ thread_local! {
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
-    static PASS_BUDGET: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+    static PASS_BUDGET: std::cell::Cell<Option<(u64, u64, bool)>> = const { std::cell::Cell::new(None) };
 }
 
 /// The milliseconds of every frame the pass that uploads textures picked
@@ -2017,7 +2017,7 @@ impl State {
             );
         }
         let began = std::time::Instant::now();
-        PASS_BUDGET.set(Some(budget));
+        PASS_BUDGET.set(Some((budget.0, budget.1, bake)));
         crate::texture::BAKING.set(bake && bake_exact());
         self.heap_textures(list, heap, host);
         crate::texture::BAKING.set(false);
@@ -2135,7 +2135,10 @@ impl State {
         });
         let per_frame = match asked {
             Some(mb) => mb << 20,
-            None => staging_budget_per_frame(memory.map(|[budget, ..]| budget)),
+            None => {
+                let base = staging_budget_per_frame(memory.map(|[budget, ..]| budget));
+                if crate::pool::host_memory().2 { base.min(128 << 20) } else { base }
+            }
         };
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
@@ -2239,11 +2242,28 @@ impl State {
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
         let (span, bytes_at_most) = match PASS_BUDGET.get() {
-            Some((ms, bytes)) => {
+            Some((ms, bytes, _)) => {
                 (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
             }
             None => (span, per_frame),
         };
+        // Cool Fox: cap speculative work AFTER catch-up and early-pass
+        // additions. Material bakes sample immediately and keep their budget.
+        let required = baking || PASS_BUDGET.get().is_some_and(|(_, _, bake)| bake);
+        let (pressure, commit, limited) = crate::pool::host_memory();
+        let staging = crate::texture::live_staging_bytes();
+        let ceiling = if required || asked.is_some() { bytes_at_most } else {
+            prefetch_limit(bytes_at_most, pressure, commit < (1536 << 20), limited, staging)
+        };
+        if ceiling < bytes_at_most {
+            static CAPS: AtomicU64 = AtomicU64::new(0);
+            let n = CAPS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n.is_multiple_of(256) {
+                tracing::info!(calls = n, budget_mib = ceiling >> 20, staging_mib = staging >> 20,
+                    commit_free_mib = commit >> 20, "Cool Fox CF4 adaptive texture staging");
+            }
+        }
+        let bytes_at_most = ceiling;
         let began = std::time::Instant::now();
         BAKE_SERVED.store(0, Ordering::Relaxed);
         let mut served = true;
@@ -2391,6 +2411,12 @@ impl State {
                         "a texture already on the card is brought up to date although the card has no room for new ones"
                     );
                 }
+            }
+            // Only ordinary speculative uploads are gated here. Keep
+            // unserved slots due, and leave explicit draws and bakes alone.
+            if !required && asked.is_none() && crate::pool::host_memory().1 < (512 << 20) {
+                served = false;
+                break;
             }
             // A slot that shows the texture by an earlier view of it (one
             // from another level) goes on doing so until the upload of what
@@ -4406,6 +4432,13 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     }
 }
 
+/// Soft speculative ceiling, adapted from cool_fox residency.rs.
+fn prefetch_limit(bytes: u64, pressure: bool, critical: bool, limited: bool, staging: u64) -> u64 {
+    if critical { bytes.min(16 << 20) }
+    else if pressure || (limited && staging >= 1 << 30) { bytes.min(64 << 20) }
+    else { bytes }
+}
+
 /// Per-frame texture staging byte budget scaled from the adapter's local VRAM
 /// budget (`None` keeps the 192 MiB 12 GiB baseline).
 fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
@@ -4421,7 +4454,16 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::staging_budget_per_frame;
+    use super::{prefetch_limit, staging_budget_per_frame};
+
+    #[test]
+    fn speculative_staging_respects_pressure_and_original_ceiling() {
+        let mib = 1 << 20;
+        assert_eq!(prefetch_limit(384 * mib, false, false, true, 1024 * mib), 64 * mib);
+        assert_eq!(prefetch_limit(384 * mib, true, true, false, 0), 16 * mib);
+        assert_eq!(prefetch_limit(8 * mib, true, true, false, 0), 8 * mib);
+        assert_eq!(prefetch_limit(384 * mib, false, false, false, 0), 384 * mib);
+    }
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {

@@ -62,14 +62,31 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 /// Commit and physical-memory pressure both matter for mapped uploads.
 /// Hysteresis avoids oscillating between retaining and trimming blocks.
 fn host_pressure() -> bool {
+    host_memory().0
+}
+
+/// Pressure, commit headroom and limited-RAM classification. Reuse the
+/// sample across the pool sweep and long bindless passes (32 ms).
+pub(crate) fn host_memory() -> (bool, u64, bool) {
     use std::sync::atomic::AtomicBool;
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     static PRESSURE: AtomicBool = AtomicBool::new(false);
+    static COMMIT: AtomicU64 = AtomicU64::new(u64::MAX);
+    static LIMITED: AtomicBool = AtomicBool::new(false);
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let snapshot = || (PRESSURE.load(Ordering::Relaxed), COMMIT.load(Ordering::Relaxed), LIMITED.load(Ordering::Relaxed));
+    let tick = now();
+    let next = NEXT.load(Ordering::Relaxed);
+    if tick < next || NEXT.compare_exchange(next, tick.saturating_add(32), Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return snapshot();
+    }
     let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
-        return PRESSURE.load(Ordering::Relaxed);
+        return snapshot();
     }
+    COMMIT.store(status.ullAvailPageFile, Ordering::Relaxed);
+    LIMITED.store(status.ullTotalPhys <= 32 * (1u64 << 30), Ordering::Relaxed);
     let was = PRESSURE.load(Ordering::Relaxed);
     let pressure = pressure_state(was, status.ullAvailPhys, status.ullAvailPageFile);
     if PRESSURE.swap(pressure, Ordering::Relaxed) != pressure {
@@ -77,7 +94,7 @@ fn host_pressure() -> bool {
             commit_free_mib = status.ullAvailPageFile >> 20,
             "Cool Fox pool memory pressure");
     }
-    pressure
+    snapshot()
 }
 
 fn pressure_state(was: bool, physical: u64, commit: u64) -> bool {
