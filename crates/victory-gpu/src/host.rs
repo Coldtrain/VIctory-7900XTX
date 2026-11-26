@@ -3072,6 +3072,43 @@ pub(crate) fn next_drain() {
     }
 }
 
+/// R13c: at a scheduler dependency stall, wait for only the oldest
+/// outstanding ticket. Its title signals may unblock the next queue head.
+/// Unlike an explicit visibility drain, leave all newer tickets owned.
+pub(crate) fn next_dependency_progress() {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_NEXT_PREFIX_RETIREMENT")
+        .is_none_or(|v| v != "0"));
+    if !on {
+        next_drain();
+        return;
+    }
+    if !next_flight_pending() { return; }
+    let Some(host) = host() else { return; };
+    let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    let before = next_flight_slot().len();
+    if before == 0 { return; }
+    let started = std::time::Instant::now();
+    let retired = host.next_retire_one(&mut submitted);
+    let remaining = next_flight_slot().len();
+    drop(submitted);
+    land();
+    if retired {
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        static RETAINED: AtomicU64 = AtomicU64::new(0);
+        static WAIT_US: AtomicU64 = AtomicU64::new(0);
+        let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        let retained = RETAINED.fetch_add(u64::from(remaining > 0), Ordering::Relaxed)
+            + u64::from(remaining > 0);
+        let elapsed_us = started.elapsed().as_micros() as u64;
+        let total_us = WAIT_US.fetch_add(elapsed_us, Ordering::Relaxed) + elapsed_us;
+        if calls == 1 || calls.is_multiple_of(256) || (remaining > 0 && retained == 1) {
+            tracing::info!(calls, before, remaining, retained, elapsed_us, total_us,
+                "Relay Next R13c dependency prefix retirement");
+        }
+    }
+}
+
 /// Nonblocking GPU completion check on the submission lane. The actual
 /// retirement and title signal publication remain ordered under submitted.
 pub(crate) fn next_poll() {
