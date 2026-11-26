@@ -1,4 +1,4 @@
-//! Relay Next, sprint R4: private comparison and readback storage.
+//! Relay Next, sprint R5: parallel landing with private readback storage.
 //! Independent of the old relay flight queue. Preparation and title-memory
 //! merging deliberately retain the working synchronous implementation.
 
@@ -29,6 +29,70 @@ pub(crate) fn paired() -> bool { mode() == 2 }
 pub(crate) fn snapshots() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| paired() && std::env::var_os("VICTORY_RELAY_NEXT_SNAPSHOTS").is_none_or(|v| v != "0"))
+}
+
+pub(crate) fn parallel_landing() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| snapshots() && std::env::var_os("VICTORY_RELAY_NEXT_MERGE").is_none_or(|v| v != "0"))
+}
+
+pub(crate) fn merge_workers() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_RELAY_NEXT_MERGE_WORKERS").ok()
+        .and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).clamp(1, 8))
+}
+
+/// Conservative page-granularity check. Different jobs must never write
+/// the same title page, even through distinct shadow copies.
+pub(crate) fn disjoint_pages(mut ranges: Vec<(usize, usize)>) -> bool {
+    if ranges.iter().any(|&(lo, hi)| lo >= hi) { return false; }
+    ranges.sort_unstable();
+    ranges.windows(2).all(|w| (w[0].1 - 1) / 4096 < w[1].0 / 4096)
+}
+
+type ScanWork = Vec<(Arc<crate::shadow::Shadow>, usize, usize)>;
+type ScanResult = Vec<Vec<(usize, usize)>>;
+type ScanJob = (ScanWork, std::sync::mpsc::SyncSender<ScanResult>);
+
+/// Read-only comparison on a persistent worker while the submitting thread
+/// fetches the carded copies. No title writes are moved into this worker.
+pub(crate) fn start_scan(work: ScanWork) -> Option<std::sync::mpsc::Receiver<ScanResult>> {
+    if !parallel_landing() || work.is_empty() { return None; }
+    static WORKER: OnceLock<Option<std::sync::mpsc::SyncSender<ScanJob>>> = OnceLock::new();
+    let worker = WORKER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<ScanJob>(1);
+        match std::thread::Builder::new().name("victory-next-scan".into()).spawn(move || {
+            crate::cores::keep_helper_on_fast_cores("victory-next-scan");
+            while let Ok((work, done)) = rx.recv() {
+                let found = crate::shadow::find_all(&work);
+                if done.send(found).is_err() { break; }
+            }
+        }) {
+            Ok(_) => Some(tx),
+            Err(e) => {
+                tracing::warn!(error = %e, "Relay Next R5 scan worker unavailable; using inline scan");
+                None
+            }
+        }
+    }).as_ref()?;
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    worker.send((work, tx)).unwrap_or_else(|_| crate::host::fail(format_args!("Relay Next scan worker disconnected")));
+    Some(rx)
+}
+
+pub(crate) fn landing_stats(pieces: usize, bytes: u64, parallel: bool, elapsed_us: u64) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static PARALLEL: AtomicU64 = AtomicU64::new(0);
+    static BYTES: AtomicU64 = AtomicU64::new(0);
+    static US: AtomicU64 = AtomicU64::new(0);
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    let parallel_calls = PARALLEL.fetch_add(u64::from(parallel), Ordering::Relaxed) + u64::from(parallel);
+    let total_bytes = BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes;
+    let total_us = US.fetch_add(elapsed_us, Ordering::Relaxed) + elapsed_us;
+    if calls == 1 || calls.is_multiple_of(256) || trace() {
+        tracing::info!(calls, parallel_calls, pieces, bytes, elapsed_us, total_bytes, total_us,
+            workers = merge_workers(), "Relay Next R5 landing statistics");
+    }
 }
 
 fn trace() -> bool {
@@ -132,8 +196,8 @@ impl Ticket {
         static START: std::sync::Once = std::sync::Once::new();
         START.call_once(|| tracing::info!(
             mode = mode(), max_batches = if paired() { 2 } else { 1 }, max_title_tickets = 1, copy_queue = false,
-            private_snapshots = snapshots(),
-            "Relay Next R4: private readback storage; legacy Relay disabled"
+            private_snapshots = snapshots(), parallel_landing = parallel_landing(), merge_workers = merge_workers(),
+            "Relay Next R5: parallel landing; legacy Relay disabled"
         ));
         Self { number, progress: Progress::new(), groups: 0, start: std::time::Instant::now(),
             leases: Vec::new(), lease_keys: HashSet::new(), pins: Vec::new(), pin_keys: HashSet::new() }
@@ -255,6 +319,16 @@ mod tests {
         assert!(!p.sent(7));
         assert!(!p.visible());
     }
+    #[test]
+    fn parallel_landing_rejects_shared_pages_and_overlaps() {
+        assert!(disjoint_pages(vec![(8192, 12288), (0, 4096)]));
+        assert!(disjoint_pages(vec![(0, 4096), (4096, 8192)]));
+        assert!(!disjoint_pages(vec![(0, 2048), (2048, 4096)]));
+        assert!(!disjoint_pages(vec![(4096, 8192), (4096, 8192)]));
+        assert!(!disjoint_pages(vec![(0, 8192), (4096, 12288)]));
+        assert!(!disjoint_pages(vec![(1, 1)]));
+    }
+
     #[test]
     fn two_batches_require_last_fence_and_reject_third() {
         let mut p = Progress::new();
