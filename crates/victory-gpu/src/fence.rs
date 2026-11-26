@@ -79,7 +79,7 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
         out,
     )
 }
-extern "system" fn release(this: This) -> u32 {
+pub(crate) extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
 pub(crate) extern "system" fn completed(this: This) -> u64 {

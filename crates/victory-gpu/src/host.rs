@@ -6167,7 +6167,7 @@ impl Host {
             let fence = fence as crate::object::This;
             crate::fence::set(fence, value);
             // The fence's actual Release drops the boxed object if needed.
-            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(fence, 0x10)(fence);
+            crate::fence::release(fence);
         }
         if count != 0 { crate::relay_next::signal_stats(1, count as u64); }
         NEXT_FLIGHT_LIVE.store(false, Ordering::Release);
