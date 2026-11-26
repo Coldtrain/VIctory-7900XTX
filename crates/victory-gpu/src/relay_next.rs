@@ -188,6 +188,32 @@ pub(crate) fn overlap_stats(paired: bool, queued: bool) {
     }
 }
 
+/// R12b: record the trailing compare after sending the title lists.
+/// Keep the same queue, command boundaries, and final visibility fence.
+pub(crate) fn overlap_compare() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| ticket_overlap() && std::env::var_os("VICTORY_RELAY_NEXT_OVERLAP_COMPARE").is_some_and(|v| v == "1"))
+}
+
+pub(crate) fn compare_overlap_stats(us: u64, pending_before: bool, pending_after: bool, passes: usize) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static US: AtomicU64 = AtomicU64::new(0);
+    static BUSY: AtomicU64 = AtomicU64::new(0);
+    static FULL: AtomicU64 = AtomicU64::new(0);
+    static PASSES: AtomicU64 = AtomicU64::new(0);
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    let record_us = US.fetch_add(us, Ordering::Relaxed) + us;
+    if pending_before { BUSY.fetch_add(1, Ordering::Relaxed); }
+    if pending_before && pending_after { FULL.fetch_add(1, Ordering::Relaxed); }
+    let passes = PASSES.fetch_add(passes as u64, Ordering::Relaxed) + passes as u64;
+    if calls == 1 || calls.is_multiple_of(256) || trace() {
+        tracing::info!(calls, record_us, passes,
+            render_pending_at_start = BUSY.load(Ordering::Relaxed),
+            render_pending_at_end = FULL.load(Ordering::Relaxed),
+            "Relay Next R12b compare preparation overlap statistics");
+    }
+}
+
 pub(crate) fn snapshots() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| paired() && std::env::var_os("VICTORY_RELAY_NEXT_SNAPSHOTS").is_none_or(|v| v != "0"))

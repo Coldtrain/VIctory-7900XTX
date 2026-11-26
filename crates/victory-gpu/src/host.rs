@@ -2541,6 +2541,9 @@ struct CardPlan {
     ranges: Vec<CardRange>,
     /// The compare, run after the submission's lists.
     check: Option<ID3D12CommandList>,
+    /// R12b reserves the closed compare list before submission, then
+    /// records it only after the preceding render batches are queued.
+    check_pending: bool,
     /// The copies whose card side was brought up to date, alive until the
     /// submission has run.
     _synced: Vec<std::sync::Arc<crate::shadow::Shadow>>,
@@ -5022,6 +5025,7 @@ impl Host {
             next_snapshot,
             ranges: Vec::new(),
             check: None,
+            check_pending: false,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
             sent_as,
@@ -5084,11 +5088,35 @@ impl Host {
             let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
             };
-            let (allocator, list) = &check;
-            // SAFETY: the list's last run finished (its submission was
-            // waited for, and it came back after that); live buffers; the
-            // compare's own root signature.
-            let recorded = unsafe {
+            let defer = crate::relay_next::overlap_compare() && !flown && !late();
+            #[cfg(feature = "diagnostics")]
+            let defer = defer && !timing();
+            let recorded = if defer {
+                // Same COM object will be reset and recorded immediately
+                // before its own ExecuteCommandLists. It is not submitted
+                // in the earlier render group.
+                check.1.cast::<ID3D12CommandList>()
+            } else {
+                Self::record_card_compare(work, &plan, &check, flown)
+            };
+            match recorded {
+                Ok(list) => {
+                    plan.check = Some(list);
+                    plan.check_pending = defer;
+                }
+                Err(e) => fail(format_args!("the compare of host copies in the card's memory could not be prepared ({e})")),
+            }
+            plan.lists.push((true, check));
+        }
+        work.out += 1;
+        Some(plan)
+    }
+
+    /// Record the same comparison as before R12b. The caller owns the
+    /// plan and submission lock; its reserved allocator is not in use.
+    fn record_card_compare(work: &CardWork, plan: &CardPlan, check: &Prelude, flown: bool) -> windows::core::Result<ID3D12CommandList> {
+        let (allocator, list) = check;
+        let recorded = unsafe {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
@@ -5124,14 +5152,27 @@ impl Host {
                     list.cast()
                 })()
             };
-            match recorded {
-                Ok(list) => plan.check = Some(list),
-                Err(e) => fail(format_args!("the compare of host copies in the card's memory could not be recorded ({e})")),
-            }
-            plan.lists.push((true, check));
-        }
-        work.out += 1;
-        Some(plan)
+        recorded
+    }
+
+    /// The reserved list must be closed before submitting the group that
+    /// contains it. Only its CPU-side command recording is deferred; no
+    /// title memory is read and no CPU-visible completion is published.
+    fn record_pending_compare(&self, plan: &CardPlan, previous: Option<u64>) {
+        let began = std::time::Instant::now();
+        let pending = || previous.is_some_and(|target| {
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            completed != u64::MAX && completed < target
+        });
+        let busy = pending();
+        let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        let work = work.as_ref().expect("R12b live comparison work");
+        let check = plan.lists.iter().find(|(compare, _)| *compare).map(|(_, list)| list)
+            .expect("R12b reserved comparison list");
+        Self::record_card_compare(work, plan, check, false).unwrap_or_else(|e|
+            fail(format_args!("Relay Next R12b deferred compare recording failed: {e}")));
+        crate::relay_next::compare_overlap_stats(began.elapsed().as_micros() as u64, busy, pending(),
+            plan.ranges.iter().filter(|range| range.compared).count());
     }
 
     /// With [`relay`]: whether the compare's result area is half taken by
@@ -6620,7 +6661,18 @@ impl Host {
         }
         submitting(2, runs.len());
         let mut next_descriptor_horizon = None;
+        let mut compare_pending = card.as_ref().is_some_and(|plan| plan.check_pending);
+        let mut previous_group = None;
         for (i, group) in groups.iter().enumerate() {
+            if compare_pending {
+                let plan = card.as_ref().expect("pending R12b plan");
+                // Also works if there is only one group: record before
+                // sending it, with no claimed overlap in that case.
+                if group.iter().any(|list| list.as_ref() == plan.check.as_ref()) {
+                    self.record_pending_compare(plan, previous_group);
+                    compare_pending = false;
+                }
+            }
             *submitted += 1;
             let started = std::time::Instant::now();
             let split_tickets = second_ticket.is_some();
@@ -6713,7 +6765,11 @@ impl Host {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
+            previous_group = Some(*submitted);
             let _ = (i, started);
+        }
+        if compare_pending {
+            fail(format_args!("Relay Next R12b comparison was not submitted"));
         }
         let _ = &firsts;
         if next_ticket.is_none() {
