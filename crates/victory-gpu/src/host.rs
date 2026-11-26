@@ -293,6 +293,8 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
             });
         }
         let Some(a) = aside.as_mut() else { return Ok(()) };
+        device.GetDeviceRemovedReason()?;
+        prep_trace(|| format!("residency map begin fence={} completed={}", a.value + 1, a.fence.GetCompletedValue()));
         a.queue.ExecuteCommandLists(&[Some(a.list.clone())]);
         a.value += 1;
         a.queue.Signal(&a.fence, a.value)?;
@@ -300,6 +302,8 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
             a.fence.SetEventOnCompletion(a.value, a.event)?;
             WaitForSingleObject(a.event, INFINITE);
         }
+        prep_trace(|| format!("residency map end fence={} completed={}", a.value, a.fence.GetCompletedValue()));
+        device.GetDeviceRemovedReason()?;
     }
     let us = started.elapsed().as_micros() as u64;
     MAPPED[0].fetch_add(1, Ordering::Relaxed);
@@ -327,7 +331,10 @@ pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> window
     let started = std::time::Instant::now();
     let object: ID3D12Pageable = object.cast()?;
     // SAFETY: a live heap or resource of the device's.
+    let key = object.as_raw() as usize;
+    prep_trace(|| format!("MakeResident begin object={key:#x}"));
     let made = unsafe { device.MakeResident(&[Some(object)]) };
+    prep_trace(|| format!("MakeResident end object={key:#x} elapsed_us={} result={made:?}", started.elapsed().as_micros()));
     let us = started.elapsed().as_micros() as u64;
     RESIDENT[0].fetch_add(1, Ordering::Relaxed);
     RESIDENT[1].fetch_add(us, Ordering::Relaxed);
@@ -598,6 +605,28 @@ fn relay_trace(event: impl FnOnce() -> String) {
     trace.push_back(entry);
 }
 
+// Keep low-level preparation events separate from flight history.
+static PREP_TRACE: Mutex<std::collections::VecDeque<(u64, u32, String)>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+fn prep_trace(event: impl FnOnce() -> String) {
+    if !relay_trace_on() { return; }
+    let entry = (now_us(), thread_id(), event());
+    let mut trace = PREP_TRACE.lock().unwrap_or_else(|e| e.into_inner());
+    if trace.len() >= 1024 { trace.pop_front(); }
+    trace.push_back(entry);
+}
+
+// Only called at submission phase boundaries, not for every draw.
+fn prep_checkpoint(device: &ID3D12Device, phase: &str) {
+    if !relay_trace_on() { return; }
+    relay_trace(|| format!("prepare phase={phase}"));
+    // SAFETY: a plain device status query.
+    if let Err(e) = unsafe { device.GetDeviceRemovedReason() } {
+        fail(format_args!("device removed during submission preparation at {phase}: {e}"));
+    }
+}
+
 /// What the submitting thread is doing (0 nothing: between submissions,
 /// 1 preparing one, 2 waiting for the card to run it, 3 copying back what
 /// it wrote), the lists of that submission, and since when ([`now_us`]).
@@ -657,6 +686,13 @@ pub(crate) fn log_removal_context() {
             let _ = writeln!(report, "  {:.3} ms before, thread {thread}: {event}", now.saturating_sub(*at) as f64 / 1000.0);
         }
         tracing::error!("RELAY2 flight recorder ({} events):\n{}", trace.len(), report);
+        drop(trace);
+        let prep = PREP_TRACE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut report = String::new();
+        for (at, thread, event) in prep.iter() {
+            let _ = writeln!(report, "  {:.3} ms before, thread {thread}: {event}", now.saturating_sub(*at) as f64 / 1000.0);
+        }
+        tracing::error!("RELAY2 preparation recorder ({} events):\n{}", prep.len(), report);
     }
     if dred_any() {
         let data = host().map(|h| h.removal_data(&[])).unwrap_or_default();
@@ -5492,11 +5528,13 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let was_working = working(true);
         submitting(1, runs.len());
+        prep_checkpoint(&self.device, "submission entry");
         #[cfg(feature = "diagnostics")]
         let ahead = Split::begin();
         #[cfg(feature = "diagnostics")]
         SPLIT[11].fetch_add(called.elapsed().as_nanos() as u64, Ordering::Relaxed);
         stage.next("submit: steps given to the card");
+        prep_checkpoint(&self.device, "submit: steps given to the card");
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
@@ -5505,6 +5543,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
+        prep_checkpoint(&self.device, "submit: waiting for flights it reads from");
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if own.is_none()
@@ -5536,6 +5575,7 @@ impl Host {
         };
         let parts: Vec<usize> = parts.iter().map(|&n| n + usize::from(own.is_some())).collect();
         stage.next("submit: the sweep");
+        prep_checkpoint(&self.device, "submit: the sweep");
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -5560,6 +5600,7 @@ impl Host {
         }
         let behind = late && flying();
         stage.next("submit: gathering what to ask about");
+        prep_checkpoint(&self.device, "submit: gathering what to ask about");
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
@@ -5600,10 +5641,12 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
+            prep_checkpoint(&self.device, "submit: asking the write watch");
             crate::watch::ask_once(&ranges);
             #[cfg(feature = "diagnostics")]
             split.part(0);
             stage.next("submit: title bytes under flights' writes");
+            prep_checkpoint(&self.device, "submit: title bytes under flights' writes");
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
@@ -5630,27 +5673,33 @@ impl Host {
         // What flights in the air may write.
         let air = line().written.clone();
         stage.next("submit: refreshes ahead of writes");
+        prep_checkpoint(&self.device, "submit: refreshes ahead of writes");
         if refresh_front() {
             batch.refresh_front(runs, &parts);
         } else if ahead_of_writes() {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
         stage.next("submit: the lists' steps");
+        prep_checkpoint(&self.device, "submit: the lists' steps");
         for list in runs {
+            prep_trace(|| format!("deferred begin submission={this_submission} list={:#x}", list.list.as_raw() as usize));
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
+            prep_trace(|| format!("deferred end submission={this_submission} list={:#x}", list.list.as_raw() as usize));
         }
         batch.fill();
         stage.next("submit: the last refreshes");
+        prep_checkpoint(&self.device, "submit: the last refreshes");
         batch.flush();
         crate::watch::ask_once_end();
         #[cfg(feature = "diagnostics")]
         split.part(2);
         stage.next("submit: snapshots");
+        prep_checkpoint(&self.device, "submit: snapshots");
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -5664,6 +5713,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         split.part(3);
         stage.next("submit: copies in the card's memory");
+        prep_checkpoint(&self.device, "submit: copies in the card's memory");
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
@@ -5692,6 +5742,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
+        prep_checkpoint(&self.device, "submit: waiting for the heaps' records");
         drop(heaps_synced);
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
@@ -5700,6 +5751,7 @@ impl Host {
         split.part(15);
         let prepared = std::time::Instant::now();
         stage.next("submit: sending");
+        prep_checkpoint(&self.device, "submit: sending");
         // When it runs on the card, for the timeline.
         #[cfg(feature = "diagnostics")]
         let stamp = stamps::take();
@@ -6223,6 +6275,7 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         let _closing = crate::timeline::span("closing a host list");
+        prep_trace(|| format!("list close begin list={:#x}", self.list.as_raw() as usize));
         self.twins_to_depth();
         self.textures_back();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -6247,6 +6300,7 @@ impl HostList {
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
         }
+        prep_trace(|| format!("list close end list={:#x}", self.list.as_raw() as usize));
     }
 
     /// `work` finds, on a thread of ours, refreshes that belong at this
@@ -6274,6 +6328,7 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        prep_trace(|| format!("list reset begin list={:#x} allocator={:#x}", self.list.as_raw() as usize, self.allocator.as_raw() as usize));
         self.changed_something();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
@@ -6306,6 +6361,7 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        prep_trace(|| format!("list reset end list={:#x}", self.list.as_raw() as usize));
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
@@ -6656,6 +6712,7 @@ impl HostList {
         else {
             fail(format_args!("no host list for a state prelude"));
         };
+        prep_trace(|| format!("state prelude begin list={:#x} barriers={} copies={}", list.as_raw() as usize, barriers.len() + to_copy.len(), syncs.len()));
         // SAFETY: the prelude is not executing (every submission is waited
         // for); the textures are live.
         let recorded = unsafe {
@@ -6676,6 +6733,7 @@ impl HostList {
         if let Err(e) = recorded {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
+        prep_trace(|| format!("state prelude end list={:#x}", list.as_raw() as usize));
         list.cast().ok()
     }
 
