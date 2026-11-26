@@ -43,13 +43,16 @@ $settings = @{
     VICTORY_RELAY_NEXT_MERGE_WORKERS = '4'
     VICTORY_RELAY_NEXT_TRACE = '0'
     VICTORY_ASYNC_SUBMIT = '1'
-    VICTORY_THIN = '0'
+    # Cool Fox measured 75 -> 68 ms with thin recording on its AMD baseline.
+    # Use the existing ordered translation workers, without inline readback.
+    VICTORY_THIN = '1'
+    VICTORY_THIN_THREADS = '8'
     VICTORY_UPLOAD_AHEAD = '1'
     VICTORY_CARD_STEPS = '0'
     VICTORY_TEXTURE_NO_WAIT = '0'
     VICTORY_D3D12_DRED = 'light'
     VICTORY_D3D12_DEBUG = '0'
-    VICTORY_LOG = 'warn,victory_gpu::host=info,victory_gpu::relay_next=info,victory_gpu::queue::behind=info'
+    VICTORY_LOG = 'warn,victory_gpu::host=info,victory_gpu::relay_next=info,victory_gpu::list::thin=info,victory_gpu::queue::behind=info'
     VICTORY_AMBIENT = '0.8'
     VICTORY_SHOW_AFTER = '1'
     VICTORY_SKIP_PIPELINES = 'none'
@@ -67,7 +70,8 @@ if ($Parallel) {
 # Source: https://github.com/codec-d/cool_fox/blob/main/Play-VIctory.cmd
 # Only use switches already implemented in our R13c source. Keep the
 # established Relay Next mode, console profile, and visibility rules.
-# Test one switch at a time; neither is enabled by default.
+# Thin recording is on by default for CF5; residency remains opt-in.
+# Use -More @{VICTORY_THIN='0'} for an otherwise identical comparison.
 if ($CoolFoxResidency) {
     $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'
     # Keep the existing adapter-specific allocation budget and residency guards.
