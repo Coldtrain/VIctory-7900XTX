@@ -677,7 +677,7 @@ fn prep_trace(event: impl FnOnce() -> String) {
 // submission. The horizon is a GPU fence, not CPU landing completion.
 static DESCRIPTOR_HORIZON: Mutex<u64> = Mutex::new(0);
 
-fn descriptor_fence_on() -> bool {
+pub(crate) fn descriptor_fence_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| relay_exact() && std::env::var_os("VICTORY_DESCRIPTOR_FENCE").is_none_or(|v| v != "0"))
 }
