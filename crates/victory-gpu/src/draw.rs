@@ -3429,15 +3429,24 @@ impl State {
                         // Renderer port 5: title memory in place is the
                         // card's to read where it is; nothing is copied.
                         if crate::port_cbv::in_place_on() {
-                            match crate::shadow::find(address, u64::from(size)).filter(|s| s.in_place()) {
-                                Some(shadow) => {
-                                    if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
-                                        crate::port_cbv::in_place(size);
-                                        continue;
+                            // Require the entire rounded CBV span in title
+                            // memory, not just the bytes the old fill copied.
+                            let rounded = u64::from(size.min(64 << 10)).next_multiple_of(256);
+                            if rounded != 0 && u64::from(size) <= rounded {
+                                match crate::shadow::find(address, rounded).filter(|s| s.in_place() && s.left(address) >= rounded) {
+                                    Some(shadow) => {
+                                        if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
+                                            // Keep the resource alive with the recording, independently of the heap slot.
+                                            list.keep(&shadow.buffer);
+                                            crate::port_cbv::in_place(size);
+                                            continue;
+                                        }
+                                        crate::port_cbv::copied(false);
                                     }
-                                    crate::port_cbv::copied(false);
+                                    None => crate::port_cbv::copied(true),
                                 }
-                                None => crate::port_cbv::copied(true),
+                            } else {
+                                crate::port_cbv::copied(false);
                             }
                         }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
@@ -3446,6 +3455,7 @@ impl State {
                         };
                         let slot = (std::ptr::from_ref(heap) as usize, index);
                         list.defer_constants(to, address as *const u8, size as usize, slot);
+                        crate::port_cbv::scratch_copy(size);
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {

@@ -6199,26 +6199,14 @@ impl<'a> Lower<'a> {
             let raw = self.end_guarded(at, &raw);
             let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
             let at = self.begin_guarded(Some(other));
-            // (Renderer port 5: the twin of a constant buffer's slot is a
-            // raw view of its bytes, read as one.)
-            let as_raw = super::shader::constants_raw() && super::shader::raw_views() != 0;
-            let h = if as_raw {
-                self.handle(site, src, false, (11, 0))?
-            } else {
-                self.handle(site, src, false, (13, 0x1_0000))?
-            };
+            // Unknown heap descriptors retain their original CBV twin.
+            let h = self.handle(site, src, false, (13, 0x1_0000))?;
             let mut both = Vec::new();
-            let dwords = if as_raw { self.raw_dwords(h, addr, raw.len() as u32) } else { Vec::new() };
             for (k, &r) in raw.iter().enumerate() {
                 let b = self.cur;
-                let x = match dwords.get(k) {
-                    Some(&x) => x,
-                    None => {
-                        let off = self.s.m.i32(4 * k as u32);
-                        let a = self.s.m.bin(b, Bin::Add, addr, off);
-                        self.cbuffer_dword(h, a)
-                    }
-                };
+                let off = self.s.m.i32(4 * k as u32);
+                let a = self.s.m.bin(b, Bin::Add, addr, off);
+                let x = self.cbuffer_dword(h, a);
                 both.push((x, r));
             }
             let both = self.end_guarded(at, &both);
@@ -6750,51 +6738,27 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Renderer port 5 (`VICTORY_PORT_CBV=1`, [`super::shader::constants_raw`]):
-    /// the handle a constant buffer `src` is read through as raw bytes, or
-    /// `None` to read it as a constant buffer, as before.
-    ///
-    /// The console takes constant buffers on 16 bytes, the host on 256: the
-    /// layer copied each one the title's tables name into upload memory of
-    /// its own at every submission (some 23,000 a frame of the city, out of
-    /// the title's graphics memory, which renderer port 1 has the card read
-    /// in place), and each root one not on 256 bytes (64 KiB each). A raw
-    /// view starts on 16 bytes and a root SRV anywhere on 4, so read so the
-    /// card can take the title's bytes where they are:
-    /// - a table's (or one picked from the view heap): through the raw twin
-    ///   of its slot ([`super::shader::raw_views`]), which the host makes a
-    ///   raw view of the same bytes; a twin's reads end where the view does,
-    ///   as a constant buffer's do;
-    /// - root CBVs retain their existing bounded constant-buffer binding.
-    ///
-    /// Anything else (a descriptor built otherwise, or chosen between kinds of
-    /// parameter) stays a constant buffer.
+    /// Raw CBV loads are allowed only for an explicitly declared, statically
+    /// identified table CBV. Draw::tables makes those tables in dynamic
+    /// slots, whose constant_at/constant_raw_at always provide a raw SRV
+    /// twin as well as the normal CBV. The title's original heap slots use
+    /// a different twin convention, so bindless, root and ambiguous
+    /// descriptor loads must keep their original lowering.
     fn constants_raw(&mut self, site: Site, src: &Source) -> Result<Option<V>, Why> {
-        if !super::shader::constants_raw() {
+        if !super::shader::constants_raw() || super::shader::raw_views() == 0 {
             return Ok(None);
         }
-        // Root CBVs have no explicit size. Keep their existing CBV binding:
-        // a root SRV is not equivalent, particularly with bounded SRV tables
-        // and the raw-view alignment/bias rules. Optimize heap views only.
-        if matches!(src, Source::Built { .. }) {
+        let Source::Loaded { load, .. } = src else {
+            return Ok(None);
+        };
+        let Some(param) = self.scalar.get(load).and_then(|a| self.x.native.layout.get(a.param)) else {
+            return Ok(None);
+        };
+        if param.root != RootType::Table
+            || !self.used_kind(src).is_some_and(|u| u.kind == ResourceType::Cbv)
+        {
             return Ok(None);
         }
-        if super::shader::raw_views() == 0 {
-            return Ok(None);
-        }
-        let x = self.x;
-        let scalar = &self.scalar;
-        let through_heap = src.leaves().iter().all(|leaf| match leaf {
-            Source::Loaded { load, .. } | Source::Fetched { load, .. } => scalar
-                .get(load)
-                .and_then(|a| x.native.layout.get(a.param))
-                .is_some_and(|p| matches!(p.root, RootType::Table | RootType::ResourceHeap)),
-            _ => false,
-        });
-        if !through_heap {
-            return Ok(None);
-        }
-        // (Raw, so `raw_twin` gives the twin's index.)
         Ok(Some(self.handle(site, src, false, (11, 0))?))
     }
 
@@ -7347,11 +7311,6 @@ impl<'a> Lower<'a> {
         const RAW: u32 = 11;
         const CONSTANT: u32 = 13;
         let first = super::shader::raw_views();
-        // Port 5 changes CBV twins to raw SRVs. A conventional CBV load
-        // must select the original CBV, not annotate the raw twin as a CBV.
-        if super::shader::constants_raw() && props.0 & 0xFF == CONSTANT {
-            return (index, false);
-        }
         let picked = |leaf: &&Source| {
             let (Source::Loaded { load, .. } | Source::Fetched { load, .. }) = leaf else {
                 return false;
