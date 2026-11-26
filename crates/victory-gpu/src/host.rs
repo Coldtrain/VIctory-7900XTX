@@ -4658,7 +4658,21 @@ impl Host {
         };
         if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
             let size = total.next_multiple_of(16 << 20);
-            f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+            // Relay only copies GPU bytes into this allocation, then the
+            // CPU reads them after its fence. No UAV or custom heap needed.
+            f.buffer = self.read_back_buffer(size).and_then(|buffer| {
+                let mut data = std::ptr::null_mut();
+                // SAFETY: a CPU-readable readback buffer; its mapping is
+                // kept until the completed fetch buffer is replaced.
+                match unsafe { buffer.Map(0, None, Some(&mut data)) } {
+                    Ok(()) => Some((buffer, data as usize, size)),
+                    Err(e) => {
+                        tracing::warn!(error = %e, size, "no mapping for relay readback");
+                        None
+                    }
+                }
+            });
+            tracing::info!(size, "relay fetch uses dedicated READBACK heap");
         }
         let Some((buffer, data, _)) = f.buffer.clone() else {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
