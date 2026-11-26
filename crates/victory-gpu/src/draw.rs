@@ -339,7 +339,7 @@ pub(crate) struct State {
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    dynamic: Vec<(usize, u64, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -356,13 +356,31 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for &(heap, generation, first, n) in &self.dynamic {
+            crate::descriptor::release_dynamic(heap, generation, first, n);
         }
     }
 }
 
 impl State {
+    /// Cool Fox: recycle descriptor slots at confirmed GPU completion,
+    /// but only for a detached recording that cannot be submitted again.
+    /// Keep other state and resources alive until ordinary recycling.
+    pub(crate) fn release_detached_tables(&mut self) {
+        let mut slots = 0u64;
+        for (heap, generation, first, n) in self.dynamic.drain(..) {
+            crate::descriptor::release_dynamic(heap, generation, first, n);
+            slots += u64::from(n);
+        }
+        if slots != 0 {
+            static RELEASED: AtomicU64 = AtomicU64::new(0);
+            let old = RELEASED.fetch_add(slots, Ordering::Relaxed);
+            if old == 0 || old / 65536 != (old + slots) / 65536 {
+                tracing::info!(slots = old + slots, "Cool Fox CF5 descriptor slots released");
+            }
+        }
+    }
+
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
     /// until the title resets the list. A frame of the opening cutscene
@@ -384,9 +402,7 @@ impl State {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
-        for (heap, first, n) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, first, n);
-        }
+        self.release_detached_tables();
         self.fresh_tables.clear();
         self.recording = 0;
         self.root_srv_slots.clear();
@@ -1766,7 +1782,7 @@ impl State {
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
+                self.dynamic.push((key.0, host.generation, index, 1));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -1837,7 +1853,7 @@ impl State {
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
+                self.dynamic.push((key.0, host.generation, index, 1));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -3343,7 +3359,7 @@ impl State {
             };
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
             self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+                .push((std::ptr::from_ref(heap) as usize, host.generation, first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());

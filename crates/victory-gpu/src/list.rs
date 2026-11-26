@@ -203,6 +203,11 @@ impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }
+
+    /// Only called after the final fence for this detached recording.
+    pub(crate) fn release_tables(&mut self) {
+        self._state.release_detached_tables();
+    }
 }
 
 /// A host list that has run and waits to be used again, and the bytes of

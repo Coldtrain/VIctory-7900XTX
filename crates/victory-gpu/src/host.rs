@@ -6287,6 +6287,12 @@ impl Host {
             SUBMISSION_US[1].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         flight.ticket.finish(&self.device);
+        // The recording has been detached from the title list, and its
+        // final GPU fence was observed. Keep the allocator/resource
+        // quarantine but return descriptor slots now, as in Cool Fox.
+        for &i in &flight.order {
+            flight.lists[i].release_tables();
+        }
         FINISHED.store(flight.number, Ordering::Release);
         bury(flight.number);
         line().landed.push((flight.lists, flight.order));
