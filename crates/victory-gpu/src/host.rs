@@ -4032,29 +4032,49 @@ fn read_backs(list: &HostList) {
 
 /// After the card ran what declared `back`: what shaders wrote there goes
 /// into title memory, and the ranges are done with.
+fn back_scan_work(back: &[Declared]) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+    let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    for (shadow, declared) in back {
+        if shadow.carded() {
+            continue;
+        }
+        let mut sorted = declared.clone();
+        sorted.sort_unstable();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for (from, to) in sorted {
+            match spans.last_mut() {
+                Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                _ => spans.push((from, to)),
+            }
+        }
+        work.extend(spans.into_iter().map(|(from, to)| (shadow.clone(), from, to)));
+    }
+    work
+}
+
+type NextScan = (Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>, std::sync::mpsc::Receiver<Vec<Vec<(usize, usize)>>>);
+
 fn hand_back(back: &[Declared]) {
+    hand_back_scanned(back, None);
+}
+
+fn hand_back_scanned(back: &[Declared], scan: Option<NextScan>) {
     if crate::shadow::wide_back() {
         // Every range first (the pieces that differ, found on several
         // threads), then the merges, in order, as below.
-        let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-        for (shadow, declared) in back {
-            if shadow.carded() {
-                continue;
-            }
-            let mut sorted = declared.clone();
-            sorted.sort_unstable();
-            let mut spans: Vec<(usize, usize)> = Vec::new();
-            for (from, to) in sorted {
-                match spans.last_mut() {
-                    Some(last) if from <= last.1 => last.1 = last.1.max(to),
-                    _ => spans.push((from, to)),
-                }
-            }
-            work.extend(spans.into_iter().map(|(from, to)| (shadow.clone(), from, to)));
-        }
         #[cfg(feature = "diagnostics")]
         let scanning = std::time::Instant::now();
-        let found = crate::shadow::find_all(&work);
+        let (work, found) = if let Some((work, scan)) = scan {
+            let found = scan.recv().unwrap_or_else(|_| fail(format_args!("Relay Next scan failed before CPU visibility")));
+            if found.len() != work.len() {
+                fail(format_args!("Relay Next scan returned incomplete results"));
+            }
+            (work, found)
+        } else {
+            let work = back_scan_work(back);
+            let found = crate::shadow::find_all(&work);
+            (work, found)
+        };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
         for ((shadow, from, to), found) in work.iter().zip(found) {
@@ -5275,13 +5295,24 @@ impl Host {
                 CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
                 CARD_STATS[6].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
-            if wide_merge() && pieces.len() >= 8 {
-                // The pieces are apart from one another (each its own bytes
-                // of its copy and of title memory): several at a time.
+            let merging = std::time::Instant::now();
+            let next_parallel = crate::relay_next::parallel_landing();
+            let worker_count = if next_parallel { crate::relay_next::merge_workers() } else { 8 };
+            // Reject overlapping title pages, including those named through
+            // different shadow copies. Keep original serial order otherwise.
+            let parallel = worker_count > 1 && pieces.len() >= 8 &&
+                (if crate::relay_next::enabled() {
+                    (next_parallel || wide_merge()) && crate::relay_next::disjoint_pages(
+                        pieces.iter().map(|&(i, lo, hi, _)| {
+                            let start = plan.ranges[i].shadow.span().0 as usize;
+                            (start.saturating_add(lo), start.saturating_add(hi))
+                        }).collect())
+                } else { wide_merge() });
+            if parallel {
                 let fetched = *data;
                 let counts: std::sync::Arc<Vec<std::sync::atomic::AtomicUsize>> =
                     std::sync::Arc::new((0..plan.ranges.len()).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect());
-                let each = pieces.len().div_ceil(8);
+                let each = pieces.len().div_ceil(worker_count);
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = pieces
                     .chunks(each)
                     .map(|chunk| {
@@ -5316,6 +5347,9 @@ impl Host {
                     plan.ranges[i].shadow.walls_merged(gpu.len(), merged);
                     written[i] += merged;
                 }
+            }
+            if next_parallel {
+                crate::relay_next::landing_stats(pieces.len(), total, parallel, merging.elapsed().as_micros() as u64);
             }
         }
         for (r, written) in plan.ranges.iter().zip(written) {
@@ -6161,11 +6195,27 @@ impl Host {
         let copying = std::time::Instant::now();
         // For copies in the card's memory the compare has run there: the
         // pieces that differ are fetched and merged.
+        let back = crate::picked::with(declared, &picked.written);
+        // The scanner reads only completed non-carded GPU mappings and
+        // snapshots. A card merge must not touch any of its title pages.
+        let scan = if crate::relay_next::parallel_landing() && crate::shadow::wide_back() {
+            if let Some(plan) = &card {
+                let work = back_scan_work(&back);
+                let card_ranges: Vec<_> = plan.ranges.iter().filter(|r| !r.picked)
+                    .map(|r| r.declared).collect();
+                let safe = !work.is_empty() && !card_ranges.is_empty()
+                    && work.iter().all(|(s, lo, hi)| !s.in_place() && lo < hi &&
+                        card_ranges.iter().all(|&(a,b)| a < b &&
+                            ((*hi - 1) / 4096 < a / 4096 || (b - 1) / 4096 < *lo / 4096)));
+                if safe {
+                    crate::relay_next::start_scan(work.clone()).map(|rx| (work, rx))
+                } else { None }
+            } else { None }
+        } else { None };
         if let Some(card) = &card {
             self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
         }
-        let back = crate::picked::with(declared, &picked.written);
-        hand_back(&back);
+        hand_back_scanned(&back, scan);
         if let Some(card) = card {
             self.card_done(card);
         }
