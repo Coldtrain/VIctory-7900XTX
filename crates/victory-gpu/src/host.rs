@@ -2125,6 +2125,7 @@ struct NextSnapshot {
     differs: (ID3D12Resource, usize, u64),
     fetch: Prelude,
     fetched: Mutex<Option<(ID3D12Resource, usize, u64)>>,
+    packed: bool,
 }
 
 struct CardWork {
@@ -2301,6 +2302,124 @@ pub(crate) fn next_resident_rehash() -> bool {
 /// Keep the old grid for diagnostic upload checks and legacy Relay.
 pub(crate) fn next_card_piece_bytes() -> usize {
     if next_resident_rehash() { crate::relay_next::readback_piece_bytes() } else { 65536 }
+}
+
+// R7b: one bounded, private export arena per synchronous card plan.
+const NEXT_PACK_BUDGET: u64 = 16 << 20;
+
+#[derive(Clone, Copy)]
+struct NextPackLayout {
+    results: u64,
+    stride: u64,
+    payload: u64,
+    slots: u64,
+}
+
+impl NextPackLayout {
+    fn new(results: u64, grid: usize) -> Self {
+        // Hashes widen an unaligned piece to 16-byte boundaries.
+        let stride = grid as u64 + 16;
+        Self { results, stride, payload: results * 2 + 16, slots: NEXT_PACK_BUDGET / stride }
+    }
+    fn bytes(self) -> u64 { self.payload + self.slots * self.stride }
+    fn counter(self) -> u64 { self.results * 2 }
+    fn offset(self, entry: u32, lo: usize, hi: usize, hashed_lo: usize, hashed_hi: usize) -> Option<usize> {
+        let entry = u64::from(entry);
+        if entry < self.payload || entry >= self.bytes()
+            || (entry - self.payload) % self.stride != 0
+            || lo < hashed_lo || hi > hashed_hi || lo >= hi
+            || hashed_hi.checked_sub(hashed_lo)? as u64 > self.stride
+        { return None; }
+        Some((entry + (lo - hashed_lo) as u64) as usize)
+    }
+}
+
+fn next_pack_enabled() -> bool {
+    next_resident_rehash() && crate::relay_next::snapshots() && crate::relay_next::packed_readback()
+}
+
+/// Same hash and comparison as R7a. Mode 3 additionally exports flagged
+/// pieces into a bounded arena. Overflow writes a zero table entry so the
+/// CPU falls back to the original fetch rather than losing bytes.
+fn next_pack_shader(source: &str, layout: NextPackLayout) -> String {
+    let source = source.replace("groupshared uint4 parts[64];",
+        "groupshared uint4 parts[64];\ngroupshared uint packed_slot;");
+    let tail = r#"
+    if (thread == 0u) {
+        h = parts[0];
+        [loop]
+        for (uint i = 1u; i < 64u; ++i) {
+            h = (h ^ parts[i]) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+            h = h.yzwx ^ (h >> 15);
+        }
+        if (compare != 0u) {
+            bool changed = any(h != hashes.Load4(piece * 16u));
+            uint folded = h.x ^ (h.y * 3u) ^ (h.z * 5u) ^ (h.w * 7u);
+            uint result_at = out_at + id.x * 4u;
+            differs.Store(result_at, (folded << 1u) | (changed ? 1u : 0u));
+            if (compare == 2u) hashes.Store4(piece * 16u, h);
+            if (compare == 3u) {
+                packed_slot = 0u;
+                if (changed) {
+                    uint slot;
+                    differs.InterlockedAdd(PACK_COUNTER, 1u, slot);
+                    if (slot < PACK_SLOTS) packed_slot = PACK_PAYLOAD + slot * PACK_STRIDE;
+                }
+                differs.Store(PACK_TABLE + result_at, packed_slot);
+            }
+        } else {
+            hashes.Store4(piece * 16u, h);
+        }
+    }
+    if (compare == 3u) {
+        GroupMemoryBarrierWithGroupSync();
+        if (packed_slot != 0u) {
+            [loop]
+            for (uint pos = lo + thread * 16u; pos < hi; pos += 1024u) {
+                differs.Store4(packed_slot + pos - lo, now.Load4(pos));
+            }
+        }
+    }
+}
+"#;
+    let tail = tail.replace("PACK_COUNTER", &format!("{}u", layout.counter()))
+        .replace("PACK_SLOTS", &format!("{}u", layout.slots))
+        .replace("PACK_PAYLOAD", &format!("{}u", layout.payload))
+        .replace("PACK_STRIDE", &format!("{}u", layout.stride))
+        .replace("PACK_TABLE", &format!("{}u", layout.results));
+    let (head, _) = source.split_once("    if (thread != 0u) return;")
+        .expect("card compare shader reduction anchor");
+    format!("{head}{tail}")
+}
+
+#[cfg(test)]
+mod next_pack_tests {
+    use super::*;
+    #[test]
+    fn packed_slots_are_bounded_and_cut_to_declared_bytes() {
+        for grid in [16384usize, 32768, 65536] {
+            let l = NextPackLayout::new(4 << 20, grid);
+            let first = l.payload as u32;
+            let last = (l.payload + (l.slots - 1) * l.stride) as u32;
+            assert_eq!(l.offset(first, 7, grid, 0, grid + 16), Some(first as usize + 7));
+            assert_eq!(l.offset(last, 0, grid, 0, grid + 16), Some(last as usize));
+            assert_eq!(l.offset(l.bytes() as u32, 0, 1, 0, grid), None);
+            assert_eq!(l.offset(0, 0, 1, 0, grid), None);
+            assert_eq!(l.offset(first + 1, 0, 1, 0, grid), None);
+            assert_eq!(l.offset(first, 0, grid + 17, 0, grid + 16), None);
+            assert_eq!(l.offset(first, 0, 1, 0, grid + 32), None);
+        }
+    }
+    #[test]
+    fn packed_shader_preserves_root_signature_and_replaces_all_constants() {
+        let l = NextPackLayout::new(4 << 20, 16384);
+        let s = next_pack_shader(&CARD_COMPARE.replace("65536u", "16384u"), l);
+        assert!(!s.contains("PACK_"));
+        assert!(s.contains("RootConstants(num32BitConstants=6, b0)"));
+        assert!(s.contains("compare == 3u"));
+        assert!(s.contains("GroupMemoryBarrierWithGroupSync"));
+        assert!(!s.contains("if (thread != 0u) return;"));
+    }
 }
 
 fn rehash_runs() -> bool {
@@ -4365,12 +4484,16 @@ impl Host {
         let grid = next_card_piece_bytes();
         // Keep shader and CPU indexing identical; the original shader
         // remains the byte-for-byte baseline when 64 KiB is selected.
+        let results = (1u64 << 20) * (65536 / grid as u64);
         let shader = if grid == 65536 {
             std::borrow::Cow::Borrowed(CARD_COMPARE)
         } else {
             std::borrow::Cow::Owned(CARD_COMPARE.replace("65536u", &format!("{grid}u")))
         };
-        tracing::info!(piece_bytes = grid, "Relay Next R7a: card readback grid");
+        let shader = if next_pack_enabled() {
+            std::borrow::Cow::Owned(next_pack_shader(&shader, NextPackLayout::new(results, grid)))
+        } else { shader };
+        tracing::info!(piece_bytes = grid, packed_readback = next_pack_enabled(), "Relay Next R7b: card readback grid");
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
         unsafe {
@@ -4392,9 +4515,7 @@ impl Host {
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
-        const RESULTS: u64 = 1 << 20;
-        // Same total covered address space as the original result buffer.
-        let results = RESULTS * (65536 / grid as u64);
+        // Same covered address space as the original result buffer.
         let (differs, data) = self.shared_buffer(results).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
         // SAFETY: the blob's own bytes; the root signature is inside the
@@ -4479,17 +4600,31 @@ impl Host {
         let next_snapshot = if crate::relay_next::snapshots() {
             Some(work.next_free.pop().unwrap_or_else(|| {
                 let bytes = work.differs.2;
-                let (buffer, data) = self.shared_buffer(bytes).unwrap_or_else(||
-                    fail(format_args!("Relay Next: cannot allocate private comparison results")));
+                let packed = if next_pack_enabled() {
+                    self.shared_buffer(NextPackLayout::new(bytes, next_card_piece_bytes()).bytes())
+                } else { None };
+                let (buffer, data, packed) = if let Some((buffer, data)) = packed {
+                    (buffer, data, true)
+                } else {
+                    let (buffer, data) = self.shared_buffer(bytes).unwrap_or_else(||
+                        fail(format_args!("Relay Next: cannot allocate private comparison results")));
+                    (buffer, data, false)
+                };
                 let fetch = self.make_prelude().unwrap_or_else(||
                     fail(format_args!("Relay Next: cannot allocate private fetch command list")));
                 name(&buffer, || "Relay Next private comparison results".into());
-                tracing::info!(bytes, "Relay Next R4: private snapshot storage allocated");
-                NextSnapshot { differs: (buffer, data as usize, bytes), fetch, fetched: Mutex::new(None) }
+                tracing::info!(bytes, packed, "Relay Next: private snapshot storage allocated");
+                NextSnapshot { differs: (buffer, data as usize, bytes), fetch, fetched: Mutex::new(None), packed }
             }))
         } else { None };
         let differs = next_snapshot.as_ref().map_or(&work.differs, |s| &s.differs);
         let result_bytes = differs.2;
+        if !flown && next_snapshot.as_ref().is_some_and(|s| s.packed) {
+            let layout = NextPackLayout::new(result_bytes, next_card_piece_bytes());
+            // SAFETY: this plan owns the mapping; the previous GPU fence
+            // and CPU merge completed before the arena was returned.
+            unsafe { ((differs.1 + layout.counter() as usize) as *mut u32).write_volatile(0); }
+        }
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
@@ -4706,7 +4841,10 @@ impl Host {
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         // (What is only looked at keeps its hashes: what
                         // changed there is the next declared range's to land.)
-                        card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
+                        let mode = if flown && !r.picked { 2 }
+                            else if !flown && !r.picked && plan.next_snapshot.as_ref().is_some_and(|s| s.packed) { 3 }
+                            else { 1 };
+                        card_pass(list, &r.span, size as u32, r.at, mode);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
@@ -5254,6 +5392,10 @@ impl Host {
         // where the bytes come down.
         let mut pieces: Vec<(usize, usize, usize, u64)> = Vec::new();
         let mut total = 0u64;
+        let packed = plan.next_snapshot.as_ref().is_some_and(|s| s.packed)
+            .then(|| NextPackLayout::new(results.2, next_card_piece_bytes()));
+        let mut packed_offsets = Vec::new();
+        let mut packed_complete = packed.is_some();
         plan.picked_found(differs);
         for (i, r) in plan.ranges.iter().enumerate().filter(|(_, r)| !r.picked) {
             for p in 0..r.span.pieces {
@@ -5264,12 +5406,41 @@ impl Host {
                 if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
                     pieces.push((i, lo, hi, total));
                     total += (hi - lo) as u64;
+                    if packed_complete {
+                        let layout = packed.unwrap();
+                        let offset = if r.compared {
+                            // SAFETY: completed comparison, unique valid
+                            // result index, table allocated beside flags.
+                            let table = results.1 + layout.results as usize;
+                            let entry = unsafe { ((table + (r.at + p) as usize * 4) as *const u32).read() };
+                            let (hashed_lo, hashed_hi) = r.shadow.card_hashed(r.span.first + p);
+                            layout.offset(entry, lo, hi, hashed_lo, hashed_hi)
+                        } else { None };
+                        if let Some(offset) = offset { packed_offsets.push(offset); }
+                        else { packed_complete = false; }
+                    }
                 }
             }
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
         }
         let mut written = vec![0usize; plan.ranges.len()];
-        if !pieces.is_empty() {
+        if !pieces.is_empty() && packed_complete {
+            // No second GPU command list or fence wait. Merge in precisely
+            // the original order, after the render/compare fence completed.
+            let mut title = Vec::new();
+            for (&(i, lo, hi, _), &offset) in pieces.iter().zip(&packed_offsets) {
+                // SAFETY: bounded slot and range checked above; private
+                // arena is retained until this entire CPU merge finishes.
+                let gpu = unsafe { std::slice::from_raw_parts((results.1 + offset) as *const u8, hi - lo) };
+                let merged = plan.ranges[i].shadow.card_merge(lo, gpu, &mut title);
+                plan.ranges[i].shadow.walls_merged(gpu.len(), merged);
+                written[i] += merged;
+            }
+            crate::shadow::CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
+            crate::shadow::CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
+            crate::relay_next::packed_stats(true, pieces.len(), total);
+        } else if !pieces.is_empty() {
+            if packed.is_some() { crate::relay_next::packed_stats(false, pieces.len(), total); }
             let mut leased_fetch;
             let (fetch_buffer, fetch_list) = if let Some(snapshot) = &plan.next_snapshot {
                 leased_fetch = snapshot.fetched.lock().unwrap_or_else(|e| e.into_inner());

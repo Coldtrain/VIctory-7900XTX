@@ -63,6 +63,32 @@ pub(crate) fn fine_readback_on() -> bool {
     crate::host::next_card_piece_bytes() < 65536
 }
 
+/// Export changed bytes in the compare pass; keep R7a as an independent
+/// fallback when disabled or when the bounded arena fills.
+pub(crate) fn packed_readback() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| snapshots() && std::env::var_os("VICTORY_RELAY_NEXT_PACKED_READBACK").is_some_and(|v| v == "1"))
+}
+
+pub(crate) fn packed_stats(hit: bool, pieces: usize, bytes: u64) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static AVOIDED: AtomicU64 = AtomicU64::new(0);
+    static FALLBACK: AtomicU64 = AtomicU64::new(0);
+    static PACKED_BYTES: AtomicU64 = AtomicU64::new(0);
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if hit {
+        AVOIDED.fetch_add(1, Ordering::Relaxed);
+        PACKED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    } else { FALLBACK.fetch_add(1, Ordering::Relaxed); }
+    if calls == 1 || calls.is_multiple_of(128) || trace() {
+        tracing::info!(calls, pieces, bytes, hit,
+            waits_avoided = AVOIDED.load(Ordering::Relaxed),
+            fallback = FALLBACK.load(Ordering::Relaxed),
+            packed_bytes = PACKED_BYTES.load(Ordering::Relaxed),
+            "Relay Next R7b packed readback statistics");
+    }
+}
+
 pub(crate) fn readback_stats(pieces: usize, bytes: u64, elapsed_us: u64) {
     static CALLS: AtomicU64 = AtomicU64::new(0);
     static BYTES: AtomicU64 = AtomicU64::new(0);
