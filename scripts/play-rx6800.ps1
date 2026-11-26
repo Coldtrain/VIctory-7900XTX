@@ -12,6 +12,9 @@ if (-not (Test-Path -LiteralPath $victory -PathType Leaf)) {
 $game = (Resolve-Path -LiteralPath $Exe -ErrorAction Stop).Path
 
 $settings = @{
+    # Port of the NVIDIA fork's resolution-only settings; no GPU vendor changes.
+    VICTORY_RENDER_SCALE = '0.5'
+    VICTORY_OWN_UPSCALER = '1'
     VICTORY_RELAY = '0'
     VICTORY_LATE_WAIT = '0'
     VICTORY_RELAY_COPY = '0'
