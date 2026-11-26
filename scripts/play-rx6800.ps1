@@ -3,6 +3,7 @@ param(
     [switch]$Parallel,
     [switch]$CoolFoxResidency,
     [switch]$CoolFoxThin,
+    [ValidateSet('series-s', 'series-x')][string]$Console = 'series-s',
     [hashtable]$More = @{}
 )
 
@@ -90,8 +91,9 @@ try {
         $before[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
         [Environment]::SetEnvironmentVariable($name, $settings[$name], 'Process')
     }
+    Write-Host "Console profile: $Console"
     Start-Process -FilePath $victory `
-        -ArgumentList "run `"$game`" --execute" `
+        -ArgumentList "run `"$game`" --console $Console --execute" `
         -NoNewWindow -Wait `
         -RedirectStandardOutput "$root\victory.log" `
         -RedirectStandardError "$root\victory-errors.log"
