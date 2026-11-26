@@ -175,8 +175,8 @@ struct Block<B> {
 struct Pool<B> {
     /// `None`: a block let go, its place to be used again.
     blocks: Vec<Option<Block<B>>>,
-    /// Pieces given back, and when each may be used again.
-    resting: VecDeque<(u64, Piece)>,
+    /// Pieces given back: wall-clock deadline, submission horizon, piece.
+    resting: VecDeque<(u64, u64, Piece)>,
     /// The empty blocks it was last told to keep, and the most it keeps.
     spare: usize,
     most: usize,
@@ -266,15 +266,26 @@ impl<B: Clone> Pool<B> {
     }
 
     fn give(&mut self, piece: Piece, now: u64) {
-        self.resting.push_back((now + REST, piece));
+        // Time alone does not establish GPU completion, especially during TDR.
+        let (started, _) = crate::host::submissions();
+        self.give_after(piece, now, started);
+    }
+
+    fn give_after(&mut self, piece: Piece, now: u64, submission: u64) {
+        self.resting.push_back((now.saturating_add(REST), submission, piece));
     }
 
     /// Makes the pieces that rested long enough free, and lets go of empty
     /// blocks past [`SPARE`].
     fn rested(&mut self, now: u64) {
+        let (_, finished) = crate::host::submissions();
+        self.rested_after(now, finished);
+    }
+
+    fn rested_after(&mut self, now: u64, finished: u64) {
         let mut any = false;
-        while let Some(&(ready, piece)) = self.resting.front()
-            && ready <= now
+        while let Some(&(ready, submission, piece)) = self.resting.front()
+            && ready <= now && submission <= finished
         {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
@@ -536,6 +547,20 @@ pub(crate) unsafe fn texture(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn pool_reuse_requires_time_and_submission_completion() {
+        let mut pool: Pool<u32> = Pool::new(SPARE);
+        let (piece, _, _) = pool.take(4096, 4096, 0, || Some(1)).unwrap();
+        pool.give_after(piece, 10, 42);
+        pool.rested_after(10 + REST - 1, 42);
+        assert_eq!(pool.resting.len(), 1);
+        pool.rested_after(10 + REST, 41);
+        assert_eq!(pool.resting.len(), 1);
+        pool.rested_after(10 + REST, 42);
+        assert!(pool.resting.is_empty());
+    }
+
     use super::*;
 
     #[test]
