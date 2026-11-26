@@ -5161,9 +5161,16 @@ impl Host {
         let mut dirty = crate::shadow::card_dirty(sent_as, &mut rehash);
         // The existing sync list handles the hash-only ranges as well.
         // An empty upload entry still needs its compute hash pass.
-        for (shadow, _) in &rehash {
-            if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                dirty.push((shadow.clone(), Vec::new()));
+        let mut hash_ranges = ByCopy::default();
+        if !rehash.is_empty() {
+            let upload_ids: ByCopy<()> = dirty.iter()
+                .map(|(shadow, _)| (Arc::as_ptr(shadow) as usize, ())).collect();
+            for (shadow, ranges) in rehash {
+                let key = Arc::as_ptr(&shadow) as usize;
+                if !upload_ids.contains_key(&key) {
+                    dirty.push((shadow, Vec::new()));
+                }
+                hash_ranges.insert(key, ranges);
             }
         }
         gathering.end();
@@ -5316,8 +5323,8 @@ impl Host {
                             // (In order: the next of the same piece, of the
                             // tens of thousands there are, says nothing.)
                             let mut runs: Vec<crate::shadow::CardSpan> = Vec::new();
-                            let hash_only = rehash.iter().find(|(s, _)| Arc::ptr_eq(s, shadow))
-                                .map_or(&[][..], |(_, ranges)| ranges.as_slice());
+                            let hash_only = hash_ranges.get(&(Arc::as_ptr(shadow) as usize))
+                                .map_or(&[][..], Vec::as_slice);
                             for run in ranges.iter().chain(hash_only).map(|&(a, b)| shadow.card_run(a, b)) {
                                 match runs.last_mut() {
                                     Some(last) if joins && (last.first, last.pieces) == (run.first, run.pieces) => last.to = last.to.max(run.to),
