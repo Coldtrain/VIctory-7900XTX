@@ -3936,6 +3936,66 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
+/// R14a1: an already completed recording's CPU cleanup, not a pending
+/// readback. The same ownership transfer is used by Line::landed.
+/// No title-visible writes or fence publications are performed here.
+struct NextRecycle(Vec<crate::list::Detached>, Vec<usize>);
+// SAFETY: as for Line and NextFlight: detached recordings have a single
+// owner and are never recorded into again before recycle returns them.
+unsafe impl Send for NextRecycle {}
+
+fn next_recycle_worker() -> Option<&'static std::sync::mpsc::SyncSender<NextRecycle>> {
+    static WORKER: OnceLock<Option<std::sync::mpsc::SyncSender<NextRecycle>>> = OnceLock::new();
+    WORKER.get_or_init(|| {
+        if std::env::var_os("VICTORY_RELAY_NEXT_ASYNC_RECYCLE").is_some_and(|v| v == "0") {
+            return None;
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel::<NextRecycle>(2);
+        std::thread::Builder::new().name("victory-next-completion".into()).spawn(move || {
+            while let Ok(NextRecycle(lists, order)) = rx.recv() {
+                let started = std::time::Instant::now();
+                crate::list::recycle(lists, &order);
+                next_recycle_stat(1, started.elapsed().as_micros() as u64);
+            }
+        }).ok()?;
+        tracing::info!("Relay Next R14a1 completed recording cleanup worker");
+        Some(tx)
+    }).as_ref()
+}
+
+fn next_recycle_stat(kind: usize, micros: u64) {
+    static COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    let n = COUNTS[kind].fetch_add(1, Ordering::Relaxed) + 1;
+    COUNTS[3].fetch_add(micros, Ordering::Relaxed);
+    if n == 1 || n.is_multiple_of(256) {
+        tracing::info!(queued = COUNTS[0].load(Ordering::Relaxed),
+            completed = COUNTS[1].load(Ordering::Relaxed),
+            inline = COUNTS[2].load(Ordering::Relaxed),
+            cleanup_us = COUNTS[3].load(Ordering::Relaxed),
+            "Relay Next R14a1 completion cleanup statistics");
+    }
+}
+
+fn next_recycle(lists: Vec<crate::list::Detached>, order: Vec<usize>) {
+    // Bounded admission: do not introduce a blocking worker rendezvous,
+    // nor let unusually large joined groups accumulate behind the GPU.
+    let mut batch = NextRecycle(lists, order);
+    if crate::relay_next::scheduler() && batch.0.len() <= 32 {
+        if let Some(worker) = next_recycle_worker() {
+            match worker.try_send(batch) {
+                Ok(()) => { next_recycle_stat(0, 0); return; }
+                Err(std::sync::mpsc::TrySendError::Full(back) |
+                    std::sync::mpsc::TrySendError::Disconnected(back)) => batch = back,
+            }
+        }
+    }
+    let started = std::time::Instant::now();
+    crate::list::recycle(batch.0, &batch.1);
+    if crate::relay_next::scheduler() {
+        next_recycle_stat(2, started.elapsed().as_micros() as u64);
+    }
+}
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
@@ -3946,7 +4006,7 @@ fn land() {
     };
     relay_trace(|| format!("recycle batches={} lists={}", landed.len(), landed.iter().map(|(lists, _)| lists.len()).sum::<usize>()));
     for (lists, order) in landed {
-        crate::list::recycle(lists, &order);
+        next_recycle(lists, order);
     }
 }
 
@@ -6273,7 +6333,9 @@ impl Host {
                 drop(slot);
                 drop(submitted);
             } else {
-                crate::list::recycle(lists, &order);
+                // submit returned only after its required visibility work.
+                // There is no remaining GPU or title-memory dependency.
+                next_recycle(lists, order);
             }
             if crate::relay_next::independent_flights() { land(); }
             return;
