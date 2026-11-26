@@ -374,7 +374,7 @@ impl State {
         // A closed title list may be submitted again without Reset.
         // Relay can overlap that execution with other recordings. Keep its
         // descriptor allocations owned by State until the recording is dropped.
-        if crate::shadow::relay() {
+        if crate::shadow::relay() || crate::relay_next::enabled() {
             return;
         }
         if self.tables_gone && self.dynamic.is_empty() {
