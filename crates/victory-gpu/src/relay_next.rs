@@ -1,8 +1,11 @@
-//! Relay Next, sprint R1: one synchronous, explicitly tracked submission.
+//! Relay Next, sprint R2: synchronous submissions with recording ownership.
 //! Independent of the old relay flight queue. Preparation and title-memory
 //! merging deliberately retain the working synchronous implementation.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashSet;
+use windows::core::{Interface, IUnknown};
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};
@@ -69,6 +72,27 @@ impl Progress {
     }
 }
 
+/// One recording remains owned by its submission until CPU-visible completion.
+#[derive(Default, Debug)]
+pub(crate) struct RecordingLease(AtomicU64);
+
+impl RecordingLease {
+    fn claim(&self, number: u64) -> bool {
+        number != 0 && self.0.compare_exchange(0, number, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }
+
+    fn release(&self, number: u64) -> bool {
+        self.0.compare_exchange(number, 0, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }
+
+    pub(crate) fn assert_idle(&self) {
+        let owner = self.0.load(Ordering::Acquire);
+        if owner != 0 {
+            crate::host::fail(format_args!("Relay Next recording reset before CPU-visible completion: owner={owner}"));
+        }
+    }
+}
+
 /// A ticket spans the existing submission lock, including CPU copy-back.
 /// It is not a flight queue: R1 never has two tickets executing concurrently.
 pub(crate) struct Ticket {
@@ -76,6 +100,10 @@ pub(crate) struct Ticket {
     progress: Progress,
     groups: usize,
     start: std::time::Instant,
+    leases: Vec<Arc<RecordingLease>>,
+    lease_keys: HashSet<usize>,
+    pins: Vec<IUnknown>,
+    pin_keys: HashSet<usize>,
 }
 
 impl Ticket {
@@ -83,9 +111,26 @@ impl Ticket {
         static START: std::sync::Once = std::sync::Once::new();
         START.call_once(|| tracing::info!(
             mode = 1, max_flights = 1, copy_queue = false,
-            "Relay Next R1: synchronous scheduler active; legacy Relay disabled"
+            "Relay Next R2: fence-owned recordings; legacy Relay disabled"
         ));
-        Self { number, progress: Progress::new(), groups: 0, start: std::time::Instant::now() }
+        Self { number, progress: Progress::new(), groups: 0, start: std::time::Instant::now(),
+            leases: Vec::new(), lease_keys: HashSet::new(), pins: Vec::new(), pin_keys: HashSet::new() }
+    }
+
+    pub(crate) fn claim(&mut self, lease: &Arc<RecordingLease>) {
+        if !self.lease_keys.insert(Arc::as_ptr(lease) as usize) { return; }
+        if !lease.claim(self.number) {
+            crate::host::fail(format_args!("Relay Next recording already owned: submission {}", self.number));
+        }
+        self.leases.push(lease.clone());
+    }
+
+    pub(crate) fn pin(&mut self, object: &impl Interface) {
+        if !self.pin_keys.insert(object.as_raw() as usize) { return; }
+        let keep = object.cast::<IUnknown>().unwrap_or_else(|e| {
+            crate::host::fail(format_args!("Relay Next could not retain submission {} resource: {e}", self.number))
+        });
+        self.pins.push(keep);
     }
 
     pub(crate) fn send(
@@ -96,6 +141,7 @@ impl Ticket {
         if !self.progress.sent(target) {
             crate::host::fail(format_args!("Relay Next invalid submission transition: {} {:?}", self.number, self.progress));
         }
+        for list in lists.iter().flatten() { self.pin(list); }
         // SAFETY: the caller holds the submission lock; lists and their
         // backing allocations remain owned until synchronous completion.
         unsafe {
@@ -140,8 +186,15 @@ impl Ticket {
         }
         if trace() || self.number.is_multiple_of(256) {
             tracing::info!(submission = self.number, groups = self.groups,
+                recordings = self.leases.len(), pinned_objects = self.pins.len(),
                 elapsed_us = self.start.elapsed().as_micros() as u64, "Relay Next CPU visible");
         }
+        for lease in &self.leases {
+            if !lease.release(self.number) {
+                crate::host::fail(format_args!("Relay Next recording ownership lost: submission {}", self.number));
+            }
+        }
+        // All explicit COM pins are released only after the visibility check.
     }
 }
 
@@ -165,6 +218,21 @@ mod tests {
         assert!(!p.sent(7));
         assert!(!p.visible());
     }
+    #[test]
+    fn recording_lease_is_exclusive_and_reusable_only_by_owner() {
+        let lease = RecordingLease::default();
+        assert!(!lease.claim(0));
+        assert!(lease.claim(11));
+        assert!(!lease.claim(12));
+        assert!(!lease.release(12));
+        assert!(!lease.claim(13));
+        assert!(lease.release(11));
+        assert!(lease.claim(12));
+        assert!(!lease.release(11));
+        assert!(lease.release(12));
+        lease.assert_idle();
+    }
+
     #[test]
     fn rejects_reserved_fence_values() {
         let mut p = Progress::new();
