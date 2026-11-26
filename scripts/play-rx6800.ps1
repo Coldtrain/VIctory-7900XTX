@@ -33,16 +33,22 @@ $settings = @{
     VICTORY_AMBIENT = '0.8'
     VICTORY_SHOW_AFTER = '1'
     VICTORY_SKIP_PIPELINES = 'none'
-    # Belobug renderer optimizations; CBV remains off due to artifacts.
+    # Belobug renderer optimizations; Sprint 11c CBV placement test.
     VICTORY_PORT_CONSTANTS = '1'
     VICTORY_PORT_DESCRIPTORS = '1'
-    VICTORY_PORT_CBV = '0'
+    VICTORY_PORT_CBV = '1'
+    VICTORY_PORT_CBV_PLACE = '1'
+    VICTORY_PORT_CBV_RAW16 = '1'
     VICTORY_PORT_GUARD = '1'
     VICTORY_PORT_JOURNAL = '1'
     VICTORY_PORT_TEXTURE_PRELUDE = '1' # Belobug submission-time uploads (Relay 0)
 }
 
 if ($RNext) {
+    # Keep the experimental Relay 0 CBV path out of Relay Next by default.
+    $settings.VICTORY_PORT_CBV = '0'
+    $settings.VICTORY_PORT_CBV_PLACE = '0'
+    $settings.VICTORY_PORT_CBV_RAW16 = '0'
     $settings.VICTORY_PORT_TEXTURE_PRELUDE = '0'
     $settings.VICTORY_RELAY_NEXT = '2'
     $settings.VICTORY_RELAY_NEXT_SNAPSHOTS = '1'
