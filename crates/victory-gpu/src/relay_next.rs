@@ -111,6 +111,28 @@ pub(crate) fn scheduler_stats(parts: usize, lists: usize, elapsed_us: u64) {
     }
 }
 
+/// R10 hashes exact sparse dirty-piece indices using one dispatch per
+/// buffer (or a bounded sequence for very large buffers).
+pub(crate) fn sparse_hash() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| paired() && std::env::var_os("VICTORY_RELAY_NEXT_SPARSE_HASH").is_some_and(|v| v == "1"))
+}
+
+pub(crate) fn sparse_hash_stats(old: u64, new: u64, pieces: u64) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static OLD: AtomicU64 = AtomicU64::new(0);
+    static NEW: AtomicU64 = AtomicU64::new(0);
+    static PIECES: AtomicU64 = AtomicU64::new(0);
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    let old = OLD.fetch_add(old, Ordering::Relaxed) + old;
+    let new = NEW.fetch_add(new, Ordering::Relaxed) + new;
+    let pieces = PIECES.fetch_add(pieces, Ordering::Relaxed) + pieces;
+    if calls == 1 || calls.is_multiple_of(256) || trace() {
+        tracing::info!(calls, old_dispatches = old, new_dispatches = new, saved_dispatches = old.saturating_sub(new), pieces,
+            "Relay Next R10 sparse hash statistics");
+    }
+}
+
 pub(crate) fn snapshots() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| paired() && std::env::var_os("VICTORY_RELAY_NEXT_SNAPSHOTS").is_none_or(|v| v != "0"))

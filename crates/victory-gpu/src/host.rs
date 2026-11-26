@@ -2128,7 +2128,19 @@ struct NextSnapshot {
     packed: bool,
 }
 
+const SPARSE_HASH_BYTES: usize = 1 << 20;
+
+/// One persistent index upload arena, reused only after the synchronous
+/// Relay Next ticket (including its pre-sync list) has finished.
+struct SparseHash {
+    root: ID3D12RootSignature,
+    pso: ID3D12PipelineState,
+    indices: ID3D12Resource,
+    mapped: usize,
+}
+
 struct CardWork {
+    sparse_hash: Option<SparseHash>,
     next_free: Vec<NextSnapshot>,
     /// Before a submission's lists: what changed on the copies' CPU side
     /// goes to their card side. Those not in use: a plan takes one and
@@ -2253,6 +2265,55 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
     }
 }
 "#;
+
+/// The same hash calculation and piece geometry, but group IDs select
+/// exact sparse piece indices rather than a contiguous run. Mode zero only.
+fn sparse_hash_source(grid: usize) -> String {
+    CARD_COMPARE.replace("65536u", &format!("{grid}u"))
+        .replace("UAV(u0), UAV(u1)", "UAV(u0), UAV(u1), SRV(t1)")
+        .replace("ByteAddressBuffer now : register(t0);",
+            "ByteAddressBuffer now : register(t0); ByteAddressBuffer indices : register(t1);")
+        .replace("uint piece = first + id.x;", "uint piece = indices.Load((first + id.x) * 4u);")
+}
+
+/// Build the exact set of indices represented by sorted, joined runs.
+/// No gap may be filled in: rehashing a gap could hide a shader write.
+fn sparse_hash_indices(runs: &[crate::shadow::CardSpan], capacity: usize) -> Option<Vec<u32>> {
+    let first = runs.first()?;
+    let mut total = 0usize;
+    let mut end = 0u32;
+    for (i, run) in runs.iter().enumerate() {
+        if run.skew != first.skew || run.pieces == 0 || (i > 0 && run.first < end) { return None; }
+        end = run.first.checked_add(run.pieces)?;
+        total = total.checked_add(run.pieces as usize)?;
+        if total > capacity { return None; }
+    }
+    let mut pieces = Vec::with_capacity(total);
+    for run in runs { pieces.extend(run.first..run.first + run.pieces); }
+    Some(pieces)
+}
+
+#[cfg(test)]
+mod sparse_hash_tests {
+    use super::*;
+    #[test]
+    fn sparse_indices_preserve_gaps_and_capacity() {
+        let run = |first, pieces| crate::shadow::CardSpan { from: 0, to: 0, first, pieces, skew: 16 };
+        let runs = [run(1, 2), run(9, 2), run(17, 1)];
+        assert_eq!(sparse_hash_indices(&runs, 5), Some(vec![1, 2, 9, 10, 17]));
+        assert_eq!(sparse_hash_indices(&runs, 4), None);
+        assert_eq!(sparse_hash_indices(&[run(1, 3), run(2, 1)], 8), None);
+    }
+    #[test]
+    fn source_preserves_hash_and_selects_sparse_index() {
+        let s = sparse_hash_source(16384);
+        assert!(s.contains("SRV(t1)"));
+        assert!(s.contains("indices.Load((first + id.x) * 4u)"));
+        assert!(s.contains("piece * 16384u"));
+        assert!(s.contains("hashes.Store4(piece * 16u, h)"));
+        assert!(!s.contains("uint piece = first + id.x;"));
+    }
+}
 
 /// The hash [`CARD_COMPARE`] gives of a piece with its flag.
 #[cfg(test)]
@@ -4601,6 +4662,31 @@ impl Host {
         })
     }
 
+    fn make_sparse_hash(&self, grid: usize) -> windows::core::Result<SparseHash> {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        let shader = sparse_hash_source(grid);
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: compile from a live source, then construct the matching
+        // root and pipeline from the returned shader blob.
+        unsafe {
+            D3DCompile(shader.as_ptr().cast(), shader.len(), windows::core::s!("sparse card hash"),
+                None, None, windows::core::s!("main"), windows::core::s!("cs_5_1"),
+                0, 0, &mut code, None)?;
+            let code = code.ok_or_else(windows::core::Error::empty)?;
+            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
+            let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
+                ..Default::default()
+            })?;
+            let (indices, mapped) = self.upload_buffer(SPARSE_HASH_BYTES as u64).ok_or_else(windows::core::Error::empty)?;
+            name(&indices, || "Relay Next R10 sparse hash indices".into());
+            Ok(SparseHash { root, pso, indices, mapped: mapped as usize })
+        }
+    }
+
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -4657,7 +4743,20 @@ impl Host {
             })?;
             #[cfg(feature = "diagnostics")]
             name(&pso, || crate::replay::play::COMPARE.into());
+            let sparse_hash = if crate::relay_next::sparse_hash() && next_resident_rehash() {
+                match self.make_sparse_hash(grid) {
+                    Ok(sparse) => {
+                        tracing::info!(grid, bytes = SPARSE_HASH_BYTES, "Relay Next R10 sparse hash enabled");
+                        Some(sparse)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Relay Next R10 sparse hash unavailable; retaining contiguous dispatches");
+                        None
+                    }
+                }
+            } else { None };
             Ok(CardWork {
+                sparse_hash,
                 next_free: Vec::new(),
                 sync: vec![list()?],
                 check: vec![list()?],
@@ -4821,6 +4920,13 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, differs.0.GetGPUVirtualAddress());
+                    let mut index_at = 0usize;
+                    let mut sparse_bound = false;
+                    // Never reuse the index arena across in-flight tickets
+                    // or with legacy Relay. R9's ticket is still synchronous.
+                    let sparse = if !flown && !late() && work.out == 0 && own.is_none() && rehash_runs() {
+                        work.sparse_hash.as_ref()
+                    } else { None };
                     for (shadow, ranges) in &dirty {
                         let (Some((_, Some(before), _)), size) = (shadow.card_sides(), shadow.card_hash_size()) else {
                             continue;
@@ -4831,8 +4937,6 @@ impl Host {
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         let joins = rehash_runs() || own.is_some();
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
@@ -4852,8 +4956,53 @@ impl Host {
                         };
                         // The same pieces in fewer passes (`rehash_runs`).
                         let runs = if joins { crate::shadow::joined_piece_runs(runs) } else { runs };
-                        CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
-                        CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
+                        let old_dispatches: u64 = runs.iter().map(|r| u64::from(r.pieces.div_ceil(D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION))).sum();
+                        let pieces: u64 = runs.iter().map(|r| u64::from(r.pieces)).sum();
+                        CARD_PASSES[1].fetch_add(pieces, Ordering::Relaxed);
+                        if let Some(sparse) = sparse {
+                            // Use only when it reduces the number of GPU
+                            // dispatches. The arena is indexed in dwords;
+                            // its base GPU address stays aligned.
+                            let new_dispatches = pieces.div_ceil(u64::from(D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION));
+                            if old_dispatches > new_dispatches {
+                                if let Some(indices) = sparse_hash_indices(&runs, SPARSE_HASH_BYTES / 4 - index_at) {
+                                    // SAFETY: capacity checked, disjoint
+                                    // subranges, the previous ticket finished.
+                                    std::ptr::copy_nonoverlapping(indices.as_ptr(),
+                                        (sparse.mapped as *mut u32).add(index_at), indices.len());
+                                    if !sparse_bound {
+                                        list.SetComputeRootSignature(&sparse.root);
+                                        list.SetPipelineState(&sparse.pso);
+                                        list.SetComputeRootUnorderedAccessView(3, differs.0.GetGPUVirtualAddress());
+                                        list.SetComputeRootShaderResourceView(4, sparse.indices.GetGPUVirtualAddress());
+                                        sparse_bound = true;
+                                    }
+                                    list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
+                                    list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                                    let mut done = 0usize;
+                                    while done < indices.len() {
+                                        let n = (indices.len() - done).min(D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION as usize);
+                                        let constants = [(index_at + done) as u32, runs[0].skew, size as u32, n as u32, 0, 0];
+                                        list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                                        list.Dispatch(n as u32, 1, 1);
+                                        done += n;
+                                    }
+                                    index_at += indices.len();
+                                    CARD_PASSES[0].fetch_add(new_dispatches, Ordering::Relaxed);
+                                    crate::relay_next::sparse_hash_stats(old_dispatches, new_dispatches, pieces);
+                                    continue;
+                                }
+                            }
+                        }
+                        if sparse_bound {
+                            list.SetComputeRootSignature(&work.root);
+                            list.SetPipelineState(&work.pso);
+                            list.SetComputeRootUnorderedAccessView(3, differs.0.GetGPUVirtualAddress());
+                            sparse_bound = false;
+                        }
+                        list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
+                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                        CARD_PASSES[0].fetch_add(old_dispatches, Ordering::Relaxed);
                         for run in runs {
                             card_pass(list, &run, size as u32, 0, 0);
                         }
