@@ -877,7 +877,7 @@ pub(super) fn signal(this: This, fence: This, value: u64) {
     let fence = fence as usize;
     // A queue may have a detached flight no longer in running/items.
     // Queue signals rather than publishing them from the title thread.
-    LANE.push_behind(this as usize, crate::host::next_flight_pending(), Job::Signal(fence, value), || {
+    LANE.push_behind(this as usize, crate::relay_next::independent_flights(), Job::Signal(fence, value), || {
         if !crate::host::late_signal(fence, value) {
             crate::fence::set(fence as This, value);
         }

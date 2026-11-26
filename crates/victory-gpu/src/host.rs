@@ -6773,7 +6773,8 @@ impl Host {
         let defer_next = next_fly && earlier.is_none() && parts.is_empty()
             && second_ticket.is_none() && card.is_none() && declared.is_empty()
             && picked.written.is_empty() && picked.looked.is_empty()
-            && groups.len() == 1 && next_no_visibility(runs);
+            && groups.len() == 1 && next_no_visibility(runs)
+            && !crate::memory::asked_sizes(runs.iter().copied());
         #[cfg(feature = "diagnostics")]
         let defer_next = defer_next && stamp.is_none();
         submitting(2, runs.len());
