@@ -41,6 +41,12 @@ pub(crate) fn resident_rehash() -> bool {
     *ON.get_or_init(|| paired() && std::env::var_os("VICTORY_RELAY_NEXT_RESIDENT").is_none_or(|v| v != "0"))
 }
 
+/// R6b can be disabled independently of the stable R6 rehash path.
+pub(crate) fn resident_merge() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| resident_rehash() && std::env::var_os("VICTORY_RELAY_NEXT_RESIDENT_MERGE").is_none_or(|v| v != "0"))
+}
+
 /// Counts bytes not queued for the redundant merge-result upload. Existing
 /// dirty ranges may still overlap; this is not a hardware bandwidth counter.
 pub(crate) fn resident_stats(bytes: u64, kept: bool) {
@@ -217,7 +223,7 @@ impl Ticket {
         START.call_once(|| tracing::info!(
             mode = mode(), max_batches = if paired() { 2 } else { 1 }, max_title_tickets = 1, copy_queue = false,
             private_snapshots = snapshots(), parallel_landing = parallel_landing(), merge_workers = merge_workers(),
-            resident_rehash = crate::host::next_resident_rehash(),
+            resident_rehash = crate::host::next_resident_rehash(), resident_merge = resident_merge(),
             "Relay Next R6: resident merge results; legacy Relay disabled"
         ));
         Self { number, progress: Progress::new(), groups: 0, start: std::time::Instant::now(),

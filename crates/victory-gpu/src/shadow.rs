@@ -1352,6 +1352,74 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
         .map(|i| chunk * DIFF_CHUNK + i)
 }
 
+/// Merge GPU writes relative to the pre-submit snapshot, preserving title
+/// writes in bytes the GPU did not change. Return whether title bytes changed.
+fn merge_card_bytes(title: &mut [u8], gpu: &[u8], old: &mut [u8], fast: bool) -> bool {
+    debug_assert_eq!(title.len(), gpu.len());
+    debug_assert_eq!(old.len(), gpu.len());
+    if fast && title == old {
+        let changed = &*title != gpu;
+        title.copy_from_slice(gpu);
+        old.copy_from_slice(gpu);
+        return changed;
+    }
+    let mut differs = 0u8;
+    for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
+        let wrote = if *g != *o { 0xffu8 } else { 0 };
+        let merged = (*t & !wrote) | (*g & wrote);
+        differs |= merged ^ *t;
+        *t = merged;
+        *o = merged;
+    }
+    differs != 0
+}
+
+/// A single bounded upload for CPU-owned bytes that differ from VRAM.
+fn resident_upload_span(merged: &[u8], gpu: &[u8]) -> Option<(usize, usize)> {
+    debug_assert_eq!(merged.len(), gpu.len());
+    let first = first_difference(merged, gpu)?;
+    let last = last_difference(merged, gpu).unwrap_or(first);
+    Some((first, last + 1))
+}
+
+#[cfg(test)]
+mod resident_merge_tests {
+    use super::*;
+    #[test]
+    fn fast_path_matches_original_for_all_single_byte_values_in_small_domain() {
+        for cpu in 0..=7u8 {
+            for gpu in 0..=7u8 {
+                for before in 0..=7u8 {
+                    let (mut a, mut b) = ([cpu], [before]);
+                    let (mut c, mut d) = (a, b);
+                    assert_eq!(merge_card_bytes(&mut a, &[gpu], &mut b, false),
+                        merge_card_bytes(&mut c, &[gpu], &mut d, true));
+                    assert_eq!((a, b), (c, d));
+                }
+            }
+        }
+    }
+    #[test]
+    fn competing_cpu_bytes_are_uploaded_without_overwriting_gpu_results() {
+        let mut title = [0, 9, 0, 0, 7, 0];
+        let mut old = [0; 6];
+        let gpu = [1, 0, 2, 3, 4, 5];
+        assert!(merge_card_bytes(&mut title, &gpu, &mut old, true));
+        assert_eq!(title, [1, 9, 2, 3, 4, 5]);
+        assert_eq!(old, title);
+        assert_eq!(resident_upload_span(&old, &gpu), Some((1, 2)));
+        assert_eq!(resident_upload_span(&gpu, &gpu), None);
+    }
+    #[test]
+    fn upload_bounds_cover_disjoint_cpu_changes_and_chunk_boundaries() {
+        let gpu = [0u8; 97];
+        let mut merged = gpu;
+        merged[31] = 1;
+        merged[96] = 2;
+        assert_eq!(resident_upload_span(&merged, &gpu), Some((31, 97)));
+    }
+}
+
 #[cfg(test)]
 mod difference_tests {
     use super::{first_difference, last_difference};
@@ -4335,16 +4403,10 @@ impl Shadow {
             // title's, and may have been written again since.
             // As in `copy_back`: the card's byte where it is not what it
             // was before the submission, else the title's.
-            let mut differs = 0u8;
             let was = title.clone();
-            for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
-                let wrote = if *g != *o { 0xffu8 } else { 0 };
-                let merged = (*t & !wrote) | (*g & wrote);
-                differs |= merged ^ *t;
-                *t = merged;
-                *o = merged;
-            }
-            if differs != 0 {
+            // R6b: most GPU-written pieces have no competing title write.
+            // Use the exact same three-way merge, with a bulk-copy fast path.
+            if merge_card_bytes(title, gpu, old, crate::host::next_resident_rehash() && crate::relay_next::resident_merge()) {
                 written = put_changed(start + at, &was, title);
             }
         } else {
@@ -4356,11 +4418,25 @@ impl Shadow {
         // already on the card, only the hash needs refreshing before the
         // next submission. A CPU-modified byte still requires upload.
         if crate::host::next_resident_rehash()
-            && old == gpu
             && self.card.as_ref().is_some_and(|c| c.before.lock().unwrap_or_else(|e| e.into_inner()).is_some())
+            && (crate::relay_next::resident_merge() || old == gpu)
         {
+            // Only CPU bytes which actually differ from the resident GPU
+            // result need an upload. Bound the differences by a single span
+            // to avoid introducing a large number of tiny copy commands.
+            // The entire merged interval still needs its baseline hash refreshed.
+            let upload = resident_upload_span(old, gpu);
             self.card_rehash_only(at, at + n);
-            crate::relay_next::resident_stats(n as u64, true);
+            let uploaded = if let Some((lo, hi)) = upload {
+                self.card_changed(at + lo, at + hi);
+                hi - lo
+            } else { 0 };
+            if uploaded != 0 {
+                crate::relay_next::resident_stats(uploaded as u64, false);
+            }
+            if uploaded < n {
+                crate::relay_next::resident_stats((n - uploaded) as u64, true);
+            }
         } else {
             self.card_changed(at, at + n);
             if crate::host::next_resident_rehash() {
