@@ -1,4 +1,4 @@
-//! Relay Next, sprint R5: parallel landing with private readback storage.
+//! Relay Next, sprint R6: GPU-resident merge results and hash-only refreshes.
 //! Independent of the old relay flight queue. Preparation and title-memory
 //! merging deliberately retain the working synchronous implementation.
 
@@ -33,7 +33,27 @@ pub(crate) fn snapshots() -> bool {
 
 pub(crate) fn parallel_landing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| snapshots() && std::env::var_os("VICTORY_RELAY_NEXT_MERGE").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| snapshots() && std::env::var_os("VICTORY_RELAY_NEXT_MERGE").is_some_and(|v| v == "1"))
+}
+
+pub(crate) fn resident_rehash() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| paired() && std::env::var_os("VICTORY_RELAY_NEXT_RESIDENT").is_none_or(|v| v != "0"))
+}
+
+/// Counts bytes not queued for the redundant merge-result upload. Existing
+/// dirty ranges may still overlap; this is not a hardware bandwidth counter.
+pub(crate) fn resident_stats(bytes: u64, kept: bool) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static KEPT: AtomicU64 = AtomicU64::new(0);
+    static UPLOAD: AtomicU64 = AtomicU64::new(0);
+    let count = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if kept { KEPT.fetch_add(bytes, Ordering::Relaxed); }
+    else { UPLOAD.fetch_add(bytes, Ordering::Relaxed); }
+    if count == 1 || count.is_multiple_of(4096) || trace() {
+        tracing::info!(count, hash_only_bytes = KEPT.load(Ordering::Relaxed),
+            upload_bytes = UPLOAD.load(Ordering::Relaxed), "Relay Next R6 resident merge statistics");
+    }
 }
 
 pub(crate) fn merge_workers() -> usize {
@@ -197,7 +217,8 @@ impl Ticket {
         START.call_once(|| tracing::info!(
             mode = mode(), max_batches = if paired() { 2 } else { 1 }, max_title_tickets = 1, copy_queue = false,
             private_snapshots = snapshots(), parallel_landing = parallel_landing(), merge_workers = merge_workers(),
-            "Relay Next R5: parallel landing; legacy Relay disabled"
+            resident_rehash = crate::host::next_resident_rehash(),
+            "Relay Next R6: resident merge results; legacy Relay disabled"
         ));
         Self { number, progress: Progress::new(), groups: 0, start: std::time::Instant::now(),
             leases: Vec::new(), lease_keys: HashSet::new(), pins: Vec::new(), pin_keys: HashSet::new() }
