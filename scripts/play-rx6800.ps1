@@ -4,7 +4,7 @@ param(
     [switch]$RNext,
     [switch]$CoolFoxResidency,
     [switch]$CoolFoxThin,
-    [ValidateSet('quality','balanced','performance')][string]$Fsr4K,
+    [ValidateSet('quality','balanced','performance','ultra-performance','720p')][string]$Fsr4K,
     [hashtable]$More = @{}
 )
 

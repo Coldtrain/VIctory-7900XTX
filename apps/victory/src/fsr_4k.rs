@@ -11,6 +11,7 @@ pub(super) enum FsrPreset {
     Quality,
     Balanced,
     Performance,
+    UltraPerformance,
 }
 
 impl FsrPreset {
@@ -21,7 +22,7 @@ impl FsrPreset {
             Ok(name) => Self::from_name(&name.trim().to_ascii_lowercase())
                 .map(Some)
                 .with_context(|| {
-                    format!("VICTORY_FSR_4K={name}: expected quality, balanced, performance or 0")
+                    format!("VICTORY_FSR_4K={name}: expected quality, balanced, performance, ultra-performance (720p) or 0")
                 }),
             Err(error) => Err(error.into()),
         }
@@ -32,6 +33,7 @@ impl FsrPreset {
             "quality" => Some(Self::Quality),
             "balanced" => Some(Self::Balanced),
             "performance" => Some(Self::Performance),
+            "ultra-performance" | "720p" => Some(Self::UltraPerformance),
             _ => None,
         }
     }
@@ -41,6 +43,7 @@ impl FsrPreset {
             Self::Quality => "quality",
             Self::Balanced => "balanced",
             Self::Performance => "performance",
+            Self::UltraPerformance => "ultra-performance",
         }
     }
 
@@ -50,6 +53,7 @@ impl FsrPreset {
             Self::Quality => 1,
             Self::Balanced => 2,
             Self::Performance => 3,
+            Self::UltraPerformance => 4,
         }
     }
 
@@ -58,6 +62,7 @@ impl FsrPreset {
             Self::Quality => 2.0 / 3.0,
             Self::Balanced => 1.0 / 1.7,
             Self::Performance => 0.5,
+            Self::UltraPerformance => 1.0 / 3.0,
         }
     }
 
@@ -159,6 +164,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ultra_performance_is_standard_three_times_upscaling() {
+        let preset = FsrPreset::UltraPerformance;
+        assert_eq!(preset.mode(), 4);
+        assert_eq!(preset.render_size(), [1280, 720]);
+        assert_eq!(FsrPreset::from_name("720p"), Some(preset));
+        assert_eq!(FsrPreset::from_name("ultra-performance"), Some(preset));
+        assert_eq!(preset.name(), "ultra-performance");
+    }
+
+    #[test]
     fn fsr_presets_leave_the_stock_scanout_and_settings_viewport() {
         let Some(path) = std::env::var_os("VICTORY_DISPLAY_PROFILE_TEST_IMAGE") else {
             return;
@@ -168,6 +183,7 @@ mod tests {
             (FsrPreset::Quality, [2560, 1440]),
             (FsrPreset::Balanced, [2258, 1270]),
             (FsrPreset::Performance, [1920, 1080]),
+            (FsrPreset::UltraPerformance, [1280, 720]),
         ] {
             let mut image = victory_loader::prepare(&bytes).unwrap();
             let scanout = *field::<5>(&mut image, 0x0247_ad4a).unwrap();
