@@ -2511,7 +2511,7 @@ pub(crate) fn late() -> bool {
 fn late_stage() -> u8 {
     static STAGE: OnceLock<u8> = OnceLock::new();
     *STAGE.get_or_init(|| {
-        if std::env::var_os("VICTORY_GPU_TIMING").is_some() {
+        if crate::relay_next::enabled() || std::env::var_os("VICTORY_GPU_TIMING").is_some() {
             return 0;
         }
         match std::env::var("VICTORY_LATE_WAIT").as_deref() {
@@ -5695,6 +5695,10 @@ impl Host {
         stage.next("submit: gathering what to ask about");
         prep_checkpoint(&self.device, "submit: gathering what to ask about");
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        let mut next_ticket = crate::relay_next::enabled().then(|| crate::relay_next::Ticket::new(this_submission));
+        if next_ticket.is_some() && late {
+            fail(format_args!("Relay Next R1 cannot use legacy late submission"));
+        }
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
@@ -5942,6 +5946,17 @@ impl Host {
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
+            if let Some(ticket) = next_ticket.as_mut() {
+                ticket.send(&self.device, &self.queue, &self.fence, self.event, *submitted, group, || self.card_sent());
+                #[cfg(feature = "diagnostics")]
+                crate::timeline::sent(sending, *submitted, stamp);
+                working(false);
+                #[cfg(feature = "diagnostics")]
+                let _card = crate::timeline::card_wait(Some(*submitted));
+                ticket.wait(&self.device, &self.fence, self.event);
+                stood(started);
+                working(true);
+            } else {
             let mut descriptor_horizon = descriptor_fence_on().then(|| DESCRIPTOR_HORIZON.lock().unwrap_or_else(|e| e.into_inner()));
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
@@ -5968,6 +5983,7 @@ impl Host {
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
+            }
             }
             // With timing on each group is one of `runs` (and the compare
             // of copies in the card's memory, with the last): every
@@ -5996,8 +6012,10 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
-        FINISHED.store(this_submission, Ordering::Release);
-        bury(this_submission);
+        if next_ticket.is_none() {
+            FINISHED.store(this_submission, Ordering::Release);
+            bury(this_submission);
+        }
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -6062,9 +6080,17 @@ impl Host {
             // Read backs first: a value written at the bottom of the pipe
             // may be what tells the title that they are there.
             read_backs(list);
+            if let Some(ticket) = next_ticket.as_ref() {
+                ticket.check_device(&self.device);
+            }
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
             }
+        }
+        if let Some(ticket) = next_ticket.take() {
+            ticket.finish(&self.device);
+            FINISHED.store(this_submission, Ordering::Release);
+            bury(this_submission);
         }
         self.log_messages();
         submitting(0, 0);
