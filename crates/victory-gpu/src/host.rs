@@ -2620,6 +2620,29 @@ struct CardRange {
     picked: bool,
 }
 
+/// Assign flags for a sorted declaration. Two disjoint byte ranges can
+/// share one boundary hash piece. Its flag and packed payload describe
+/// the entire piece, so both may read the same result after the fence.
+fn compare_slots(first: u32, pieces: u32, cursor: u32, last_piece: Option<u32>, bytes: u64) -> Option<(u32, u32)> {
+    let start = if Some(first) == last_piece { cursor.checked_sub(1)? } else { cursor };
+    let end = start.checked_add(pieces)?;
+    (u64::from(end) * 4 <= bytes).then_some((start, end))
+}
+
+#[cfg(test)]
+mod compare_slot_tests {
+    use super::compare_slots;
+
+    #[test]
+    fn shared_boundary_fits_at_capacity_and_preserves_nonzero_start() {
+        assert_eq!(compare_slots(11, 2, 5, Some(11), 24), Some((4, 6)));
+        assert_eq!(compare_slots(11, 1, 5, Some(11), 20), Some((4, 5)));
+        assert_eq!(compare_slots(12, 2, 5, Some(11), 24), None);
+        assert_eq!(compare_slots(11, 2, 5, None, 28), Some((5, 7)));
+        assert_eq!(compare_slots(11, 2, u32::MAX, None, u64::MAX), None);
+    }
+}
+
 impl CardPlan {
     /// Combine adjacent input pieces only when their output flags are
     /// adjacent too. The CPU still lands every declared byte range separately.
@@ -2630,13 +2653,13 @@ impl CardPlan {
             let first = ranges.next()?;
             let mut span = first.span;
             while batch && let Some(&next) = ranges.peek() {
+                let Some(offset) = next.span.first.checked_sub(span.first) else { break; };
                 if !std::sync::Arc::ptr_eq(&first.shadow, &next.shadow)
                     || first.picked != next.picked || span.skew != next.span.skew
-                    || span.first.checked_add(span.pieces) != Some(next.span.first)
-                    || first.at.checked_add(span.pieces) != Some(next.at)
+                    || offset > span.pieces || first.at.checked_add(offset) != Some(next.at)
                 { break; }
-                span.pieces += next.span.pieces;
-                span.to = next.span.to;
+                span.pieces = span.pieces.max(offset + next.span.pieces);
+                span.to = span.to.max(next.span.to);
                 ranges.next();
             }
             Some((first, span))
@@ -5440,27 +5463,33 @@ impl Host {
             next_card_prep_stat(2, began.elapsed().as_micros() as u64);
             spans.into_iter()
         });
+        let reuse_boundary = !flown && crate::relay_next::scheduler();
         for (shadow, ranges) in &declared {
             let spans = match prepared_ranges.as_mut() {
                 Some(prepared) => prepared.next().expect("R13d ordered range plan"),
                 None => merged_card_ranges(ranges.clone()),
             };
             let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
+            let mut last_piece = None;
             for (from, to) in spans {
                 let Some(span) = shadow.card_span(from, to) else {
                     continue;
                 };
-                let compared = twin && u64::from(at).saturating_add(u64::from(span.pieces)) * 4 <= result_bytes;
+                let slots = compare_slots(span.first, span.pieces, at, last_piece, result_bytes).filter(|_| twin);
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
                     declared: (from, to),
                     span,
-                    at,
-                    compared,
+                    at: slots.map_or(at, |(start, _)| start),
+                    compared: slots.is_some(),
                     picked: false,
                 });
-                if compared {
-                    at += span.pieces;
+                last_piece = None;
+                if let Some((_, end)) = slots {
+                    at = end;
+                    if reuse_boundary {
+                        last_piece = span.first.checked_add(span.pieces - 1);
+                    }
                 }
             }
         }
