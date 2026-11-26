@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Parallel,
+    [switch]$RNext,
     [switch]$CoolFoxResidency,
     [switch]$CoolFoxThin,
     [hashtable]$More = @{}
@@ -15,34 +16,12 @@ $game = (Resolve-Path -LiteralPath $Exe -ErrorAction Stop).Path
 
 $settings = @{
     # Port of the NVIDIA fork's resolution-only settings; no GPU vendor changes.
-    VICTORY_RENDER_SCALE = '0.20'
+    #VICTORY_RENDER_SCALE = '0.20'
     VICTORY_OWN_UPSCALER = '1'
     VICTORY_RELAY = '0'
     VICTORY_LATE_WAIT = '0'
     VICTORY_RELAY_COPY = '0'
-    VICTORY_RELAY_NEXT = '2'
-    VICTORY_RELAY_NEXT_SNAPSHOTS = '1'
-    VICTORY_RELAY_NEXT_MERGE = '0'
-    VICTORY_RELAY_NEXT_RESIDENT = '1'
-    VICTORY_RELAY_NEXT_READBACK_KB = '16'
-    VICTORY_RELAY_NEXT_PACKED_READBACK = '1'
-    VICTORY_RELAY_NEXT_PACKED_MB = '96'
-    VICTORY_RELAY_NEXT_SCHEDULER = '1'
-    VICTORY_RELAY_NEXT_QUEUE_DEPTH = '8'
-    VICTORY_RELAY_NEXT_JOIN_PARTS = '7'
-    VICTORY_RELAY_NEXT_DEPENDENCY_BATCHES = '1'
-    VICTORY_RELAY_NEXT_CROSS_QUEUE = '1'
-    VICTORY_RELAY_NEXT_SPARSE_HASH = '1'
-    VICTORY_RELAY_NEXT_INDEXED_REFRESH = '1'
-    VICTORY_RELAY_NEXT_REFRESH_CHUNK = '8'
-    VICTORY_RELAY_NEXT_TICKET_OVERLAP = '1'
-    VICTORY_RELAY_NEXT_OVERLAP_COMPARE = '1'
-    VICTORY_RELAY_NEXT_INDEPENDENT_FLIGHTS = '1'
-    VICTORY_RELAY_NEXT_ORDERED_SIGNALS = '1'
-    VICTORY_RELAY_NEXT_PERSISTENT_FLIGHTS = '1'
-    VICTORY_RELAY_NEXT_MAX_FLIGHTS = '4'
-    VICTORY_RELAY_NEXT_MERGE_WORKERS = '4'
-    VICTORY_RELAY_NEXT_TRACE = '0'
+    VICTORY_RELAY_NEXT = '0'
     VICTORY_ASYNC_SUBMIT = '1'
     VICTORY_THIN = '0'
     VICTORY_UPLOAD_AHEAD = '1'
@@ -54,7 +33,40 @@ $settings = @{
     VICTORY_AMBIENT = '0.8'
     VICTORY_SHOW_AFTER = '1'
     VICTORY_SKIP_PIPELINES = 'none'
+    # Belobug renderer optimizations; CBV remains off due to artifacts.
+    VICTORY_PORT_CONSTANTS = '1'
+    VICTORY_PORT_DESCRIPTORS = '1'
+    VICTORY_PORT_CBV = '0'
+    VICTORY_PORT_GUARD = '1'
+    VICTORY_PORT_JOURNAL = '1'
 }
+
+if ($RNext) {
+    $settings.VICTORY_RELAY_NEXT = '2'
+    $settings.VICTORY_RELAY_NEXT_SNAPSHOTS = '1'
+    $settings.VICTORY_RELAY_NEXT_MERGE = '0'
+    $settings.VICTORY_RELAY_NEXT_RESIDENT = '1'
+    $settings.VICTORY_RELAY_NEXT_READBACK_KB = '16'
+    $settings.VICTORY_RELAY_NEXT_PACKED_READBACK = '1'
+    $settings.VICTORY_RELAY_NEXT_PACKED_MB = '96'
+    $settings.VICTORY_RELAY_NEXT_SCHEDULER = '1'
+    $settings.VICTORY_RELAY_NEXT_QUEUE_DEPTH = '8'
+    $settings.VICTORY_RELAY_NEXT_JOIN_PARTS = '7'
+    $settings.VICTORY_RELAY_NEXT_DEPENDENCY_BATCHES = '1'
+    $settings.VICTORY_RELAY_NEXT_CROSS_QUEUE = '1'
+    $settings.VICTORY_RELAY_NEXT_SPARSE_HASH = '1'
+    $settings.VICTORY_RELAY_NEXT_INDEXED_REFRESH = '1'
+    $settings.VICTORY_RELAY_NEXT_REFRESH_CHUNK = '8'
+    $settings.VICTORY_RELAY_NEXT_TICKET_OVERLAP = '1'
+    $settings.VICTORY_RELAY_NEXT_OVERLAP_COMPARE = '1'
+    $settings.VICTORY_RELAY_NEXT_INDEPENDENT_FLIGHTS = '1'
+    $settings.VICTORY_RELAY_NEXT_ORDERED_SIGNALS = '1'
+    $settings.VICTORY_RELAY_NEXT_PERSISTENT_FLIGHTS = '1'
+    $settings.VICTORY_RELAY_NEXT_MAX_FLIGHTS = '4'
+    $settings.VICTORY_RELAY_NEXT_MERGE_WORKERS = '4'
+    $settings.VICTORY_RELAY_NEXT_TRACE = '0'
+}
+
 if ($Parallel) {
     $settings.VICTORY_ASYNC_SUBMIT = '1'
     $settings.VICTORY_THIN = '1'
@@ -66,8 +78,8 @@ if ($Parallel) {
 }
 # Configuration experiments from codec-d/cool_fox Play-VIctory.cmd.
 # Source: https://github.com/codec-d/cool_fox/blob/main/Play-VIctory.cmd
-# Only use switches already implemented in our R13c source. Keep the
-# established Relay Next mode, console profile, and visibility rules.
+# Relay 0 is the baseline. Relay Next is opt-in via -RNext.
+# Preserve the console profile and visibility rules.
 # Test one switch at a time; neither is enabled by default.
 if ($CoolFoxResidency) {
     $settings.VICTORY_CARD_BUFFERS_MIN_KB = '64'
@@ -79,6 +91,7 @@ if ($CoolFoxThin) {
     # Unlike -Parallel, do not enable inline readback or change upload workers.
     $settings.VICTORY_LOG = 'warn,victory_gpu::host=info,victory_gpu::relay_next=info,victory_gpu::list::thin=info,victory_gpu::queue::behind=info'
 }
+$settings.VICTORY_LOG = 'warn,victory_gpu=info,victory_loader=info'
 foreach ($name in $More.Keys) { $settings[$name] = $More[$name] }
 
 $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR'
@@ -92,7 +105,7 @@ try {
         [Environment]::SetEnvironmentVariable($name, $settings[$name], 'Process')
     }
     Start-Process -FilePath $victory `
-        -ArgumentList "run `"$game`" --execute" `
+        -ArgumentList "run `"$game`" --execute --console series-s" `
         -NoNewWindow -Wait `
         -RedirectStandardOutput "$root\victory.log" `
         -RedirectStandardError "$root\victory-errors.log"
