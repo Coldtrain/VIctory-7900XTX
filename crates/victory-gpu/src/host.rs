@@ -3360,7 +3360,7 @@ pub(crate) fn joins() -> (usize, usize) {
 /// memory operations, shader-write declarations or readbacks. This avoids
 /// reusing a CPU staging buffer while an earlier part reads it. Do not
 /// cross a wait, signal or present (enforced by the queue lane).
-pub(crate) fn next_joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&HostList]) -> bool {
+pub(crate) fn next_joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&'a HostList]) -> bool {
     if crate::picked::on() || upcheck::on() || next.is_empty() { return false; }
     ahead.chain(next.iter().copied()).all(|list| {
         let d = list.deferred();
