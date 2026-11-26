@@ -42,7 +42,48 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
-    SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+    // Adapted from codec-d/cool_fox f4b48ad: reclaim idle blocks on
+    // the periodic budget sweep even when no new pool allocation occurs.
+    // Preserve this fork's extra submission-completion requirement.
+    let pressure = host_pressure();
+    let limit = spares(memory, crate::host::keep_freed() && !pressure);
+    SPARES.store(limit, Ordering::Relaxed);
+    let tick = now();
+    let (_, finished) = crate::host::submissions();
+    if let Ok(mut pool) = TEXTURES.try_lock() {
+        pool.reclaim_after(tick, finished, limit, true);
+    }
+    if let Ok(mut pool) = STAGING.try_lock() {
+        let staging_limit = if pressure { 1 } else { limit };
+        pool.reclaim_after(tick, finished, staging_limit, true);
+    }
+}
+
+/// Commit and physical-memory pressure both matter for mapped uploads.
+/// Hysteresis avoids oscillating between retaining and trimming blocks.
+fn host_pressure() -> bool {
+    use std::sync::atomic::AtomicBool;
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    static PRESSURE: AtomicBool = AtomicBool::new(false);
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+        return PRESSURE.load(Ordering::Relaxed);
+    }
+    let was = PRESSURE.load(Ordering::Relaxed);
+    let pressure = pressure_state(was, status.ullAvailPhys, status.ullAvailPageFile);
+    if PRESSURE.swap(pressure, Ordering::Relaxed) != pressure {
+        tracing::info!(pressure, physical_free_mib = status.ullAvailPhys >> 20,
+            commit_free_mib = status.ullAvailPageFile >> 20,
+            "Cool Fox pool memory pressure");
+    }
+    pressure
+}
+
+fn pressure_state(was: bool, physical: u64, commit: u64) -> bool {
+    const GIB: u64 = 1 << 30;
+    if was { physical < 5 * GIB || commit < 6 * GIB }
+    else { physical <= 3 * GIB || commit <= 4 * GIB }
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
@@ -180,11 +221,12 @@ struct Pool<B> {
     /// The empty blocks it was last told to keep, and the most it keeps.
     spare: usize,
     most: usize,
+    retry_growth_at: u64,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most }
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -229,7 +271,8 @@ impl<B: Clone> Pool<B> {
         let (i, start) = match found {
             Some(found) => found,
             None => {
-                let i = self.add(make()?, ripe.started);
+                let memory = self.grow(now, &mut make)?;
+                let i = self.add(memory, ripe.started);
                 (i, self.blocks[i].as_mut()?.free.take(len, align)?)
             }
         };
@@ -242,7 +285,7 @@ impl<B: Clone> Pool<B> {
             }
             let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
             if empty < ripe.ahead
-                && let Some(memory) = make()
+                && let Some(memory) = self.grow(now, &mut make)
             {
                 self.add(memory, ripe.started);
             }
@@ -251,6 +294,17 @@ impl<B: Clone> Pool<B> {
         let again = start < block.used_to;
         block.used_to = block.used_to.max(start + len);
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
+    }
+
+    /// Avoid hammering the driver on repeated failed 64 MiB allocations.
+    /// Existing blocks are searched first, including during this backoff.
+    fn grow(&mut self, now: u64, make: &mut impl FnMut() -> Option<B>) -> Option<B> {
+        if now < self.retry_growth_at { return None; }
+        let memory = make();
+        if memory.is_none() {
+            self.retry_growth_at = now.saturating_add(500);
+        }
+        memory
     }
 
     fn add(&mut self, memory: B, made: u64) -> usize {
@@ -283,6 +337,10 @@ impl<B: Clone> Pool<B> {
     }
 
     fn rested_after(&mut self, now: u64, finished: u64) {
+        self.reclaim_after(now, finished, SPARES.load(Ordering::Relaxed), false);
+    }
+
+    fn reclaim_after(&mut self, now: u64, finished: u64, limit: usize, sweep: bool) {
         let mut any = false;
         while let Some(&(ready, submission, piece)) = self.resting.front()
             && ready <= now && submission <= finished
@@ -294,8 +352,8 @@ impl<B: Clone> Pool<B> {
             }
         }
         // (Without a piece given back too, once there is less room.)
-        let most = SPARES.load(Ordering::Relaxed).min(self.most);
-        if any || most < self.spare {
+        let most = limit.min(self.most);
+        if any || most < self.spare || sweep {
             self.spare = most;
             let mut spare = 0;
             for block in &mut self.blocks {
@@ -562,6 +620,40 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn failed_pool_growth_backs_off_and_retries() {
+        let mut pool: Pool<u32> = Pool::new(SPARE);
+        let attempts = std::cell::Cell::new(0);
+        for tick in [10, 11, 12, 509] {
+            assert!(pool.take(4096, 512, tick, || {
+                attempts.set(attempts.get() + 1);
+                None
+            }).is_none());
+        }
+        assert_eq!(attempts.get(), 1);
+        assert!(pool.take(4096, 512, 510, || Some(1)).is_some());
+    }
+
+    #[test]
+    fn periodic_trim_requires_time_and_fence_completion() {
+        let mut pool: Pool<u32> = Pool::new(SPARE);
+        let (piece, _, _) = pool.take(4096, 512, 0, || Some(1)).unwrap();
+        pool.give_after(piece, 10, 42);
+        pool.reclaim_after(10 + REST, 41, 0, true);
+        assert_eq!(pool.blocks(), 1);
+        pool.reclaim_after(10 + REST, 42, 0, true);
+        assert_eq!(pool.blocks(), 0);
+    }
+
+    #[test]
+    fn pressure_has_hysteresis() {
+        const GIB: u64 = 1 << 30;
+        assert!(pressure_state(false, 3 * GIB, 8 * GIB));
+        assert!(pressure_state(false, 8 * GIB, 4 * GIB));
+        assert!(pressure_state(true, 5 * GIB, 5 * GIB));
+        assert!(!pressure_state(true, 5 * GIB, 6 * GIB));
+    }
 
     #[test]
     fn ranges_are_cut_aligned_and_join_again() {
