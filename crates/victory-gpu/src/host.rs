@@ -506,6 +506,7 @@ fn bury(finished: u64) {
             }
         }
         *retired = pending;
+        relay_trace(|| format!("retire cutoff={finished} releasing={} pending={}", done.len(), retired.len()));
         done
     };
     drop(done);
@@ -559,6 +560,22 @@ pub(crate) fn trail(what: impl FnOnce() -> String) {
     trail.push_back(entry);
 }
 
+// A separate bounded history: pipeline compilation cannot evict Relay events.
+static RELAY_TRACE: Mutex<std::collections::VecDeque<(u64, u32, String)>> = Mutex::new(std::collections::VecDeque::new());
+
+fn relay_trace_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| relay_exact() && std::env::var_os("VICTORY_RELAY_TRACE").is_none_or(|v| v != "0"))
+}
+
+fn relay_trace(event: impl FnOnce() -> String) {
+    if !relay_trace_on() { return; }
+    let entry = (now_us(), thread_id(), event());
+    let mut trace = RELAY_TRACE.lock().unwrap_or_else(|e| e.into_inner());
+    if trace.len() >= 512 { trace.pop_front(); }
+    trace.push_back(entry);
+}
+
 /// What the submitting thread is doing (0 nothing: between submissions,
 /// 1 preparing one, 2 waiting for the card to run it, 3 copying back what
 /// it wrote), the lists of that submission, and since when ([`now_us`]).
@@ -609,6 +626,16 @@ pub(crate) fn log_removal_context() {
         return;
     }
     tracing::error!("when the host device went: {}", removal_context());
+    if relay_trace_on() {
+        let now = now_us();
+        let trace = RELAY_TRACE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut report = String::new();
+        use std::fmt::Write;
+        for (at, thread, event) in trace.iter() {
+            let _ = writeln!(report, "  {:.3} ms before, thread {thread}: {event}", now.saturating_sub(*at) as f64 / 1000.0);
+        }
+        tracing::error!("RELAY2 flight recorder ({} events):\n{}", trace.len(), report);
+    }
     if dred_any() {
         let data = host().map(|h| h.removal_data(&[])).unwrap_or_default();
         tracing::error!("device-removed data{}", if data.is_empty() { "; none" } else { &data });
@@ -3203,6 +3230,7 @@ fn land() {
         let n = line.landed.len().saturating_sub(bury_lag() as usize);
         line.landed.drain(..n).collect()
     };
+    relay_trace(|| format!("recycle batches={} lists={}", landed.len(), landed.iter().map(|(lists, _)| lists.len()).sum::<usize>()));
     for (lists, order) in landed {
         crate::list::recycle(lists, &order);
     }
@@ -3290,6 +3318,8 @@ fn late_threads() {
             }
             tracing::info!(
                 exact = relay_exact(),
+                copy_queue_requested = relay_copy(),
+                flight_recorder = relay_trace_on(),
                 "what shaders wrote is copied back by a thread of its own, beside the submitting thread (VICTORY_RELAY=1)"
             );
         }
@@ -3305,6 +3335,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     if done(&line) {
         return;
     }
+    relay_trace(|| format!("submitter wait begin reason={why} target={} lists={} settling={}", line.target, line.lists, line.settling));
     LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
     let was_working = working(false);
@@ -3328,6 +3359,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
     LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
     SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
+    relay_trace(|| format!("submitter wait end reason={why} elapsed_us={us}"));
     #[cfg(feature = "diagnostics")]
     blamed(why, us);
 }
@@ -3386,6 +3418,7 @@ fn relay_worker() {
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
                 let n = landable(&fences, completed);
+                relay_trace(|| format!("worker poll completed={completed} target={} queued={} landable={n} device_removed_sentinel={}", line.target, fences.len(), completed == u64::MAX));
                 if n == 0 {
                     // The first thing is a flight the card has not run.
                     break Err(fences[0].unwrap_or(0));
@@ -3408,6 +3441,7 @@ fn relay_worker() {
         match next {
             Ok(items) => host.relay_land(items, &mut fetch),
             Err(target) => {
+                relay_trace(|| format!("worker wait begin target={target}"));
                 let waiting = std::time::Instant::now();
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(Some(target));
@@ -3417,6 +3451,7 @@ fn relay_worker() {
                         WaitForSingleObject(event, INFINITE);
                     })
                 };
+                relay_trace(|| format!("worker wait end target={target} completed={} elapsed_us={} result={waited:?}", unsafe { host.fence.GetCompletedValue() }, waiting.elapsed().as_micros()));
                 if waited.is_err() {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
@@ -4643,6 +4678,7 @@ impl Host {
         // The sends these flights ran behind, all a fetch on the copy queue
         // is known to have run behind.
         let behind = plans.iter().map(|p| p.0.sent_as).max().unwrap_or(0);
+        relay_trace(|| format!("fetch prepared plans={} pieces={} bytes={total} behind={behind}", plans.len(), pieces.len()));
         if pieces.is_empty() {
             // Nothing to fetch: every send so far is older than the next
             // fetch, if that goes to the queue the sends went to.
@@ -4678,6 +4714,7 @@ impl Host {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
         };
         f.sent += 1;
+        relay_trace(|| format!("fetch begin fence={} bytes={total} copy_queue={}", f.sent, f.queue.is_some()));
         let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
         let copy_queue = f.queue.clone();
         let waiting = std::time::Instant::now();
@@ -4731,6 +4768,7 @@ impl Host {
             Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)")),
         };
         let us = waiting.elapsed().as_micros() as u64;
+        relay_trace(|| format!("fetch complete fence={sent} completed={} order={after} elapsed_us={us}", unsafe { fence.GetCompletedValue() }));
         RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
         {
             use crate::shadow::CARD_STATS;
@@ -4809,6 +4847,7 @@ impl Host {
     /// is complete before the title is told anything.
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        relay_trace(|| format!("landing begin items={} flights={:?}", items.len(), items.iter().filter_map(|item| match item { Late::Run(f) => Some((f.number, f.fence, f.order.len())), _ => None }).collect::<Vec<_>>()));
         let mut stage = crate::timeline::span("landing: what is to be looked through");
         {
             let flights: Vec<&Flight> = items
@@ -4841,6 +4880,7 @@ impl Host {
                         }
                     }
                 }
+                relay_trace(|| format!("landing merge begin plans={} cpu_copies={}", plans.len(), back.len()));
                 let mut hand_back = relay_hand_back(&back);
                 stage.next("landing: copies in the card's memory");
                 self.relay_card_back(&plans, fetch, &mut || {
@@ -4851,6 +4891,7 @@ impl Host {
                 });
                 stage.next("landing: copies in the PC's memory");
                 hand_back.merge();
+                relay_trace(|| format!("landing merge end elapsed_us={}", landing.elapsed().as_micros()));
                 stage.next("landing: ranges done with");
                 let finishing = std::time::Instant::now();
                 // Only now, and flight by flight: a range another flight
@@ -5657,6 +5698,7 @@ impl Host {
                 firsts.iter_mut().for_each(|first| *first += 1);
             }
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
+            relay_trace(|| format!("submit begin number={this_submission} fence={} lists={} cuts={:?} compare={}", *submitted, lists.len(), cuts, card.as_ref().is_some_and(|c| c.check.is_some())));
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 let mut from = 0;
@@ -5689,6 +5731,7 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             split.part(5);
+            relay_trace(|| format!("submit signalled number={this_submission} fence={} completed={}", *submitted, unsafe { self.fence.GetCompletedValue() }));
             let back = crate::picked::with(declared, &picked.written);
             let mut texture_back_ranges = Vec::new();
             for list in runs {
