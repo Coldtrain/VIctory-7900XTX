@@ -89,6 +89,8 @@ pub(super) trait Work: Send {
     fn persist() -> bool { false }
     fn poll() { Self::flush(); }
     fn explicit_drain() { Self::flush(); }
+    // A dependency stall need not require every outstanding GPU ticket.
+    fn dependency_progress() { Self::flush(); }
     /// Does it. `forced`: its wait was not met.
     fn go(self, forced: bool);
 }
@@ -321,7 +323,7 @@ impl<W: Work> Lane<W> {
                 // recheck actual wait values before the old forced path.
                 if crate::relay_next::ordered_signals() && W::pending() {
                     crate::relay_next::signal_stats(2, 1);
-                    W::flush();
+                    W::dependency_progress();
                     return true;
                 }
                 // Nothing is free to run. With a present in the line the
@@ -618,6 +620,8 @@ impl Work for Job {
     fn persist() -> bool { crate::relay_next::persistent_flights() }
 
     fn poll() { crate::host::next_poll(); }
+
+    fn dependency_progress() { crate::host::next_dependency_progress(); }
 
     fn explicit_drain() {
         if Self::pending() { crate::relay_next::persistent_stats(2); }
