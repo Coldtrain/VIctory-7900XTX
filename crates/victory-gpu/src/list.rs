@@ -242,6 +242,79 @@ fn pools() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL").is_none_or(|v| v != "0"))
 }
 
+/// R13a: recycle only completed, exclusively owned allocator/list pairs
+/// on dedicated workers. Bounded queues prevent unbounded retained lists;
+/// if all workers are occupied, reset on the existing caller.
+#[cfg(windows)]
+fn recycle_workers() -> &'static [std::sync::mpsc::SyncSender<Idle>] {
+    static WORKERS: std::sync::OnceLock<Vec<std::sync::mpsc::SyncSender<Idle>>> = std::sync::OnceLock::new();
+    WORKERS.get_or_init(|| {
+        let n = std::env::var("VICTORY_RELAY_NEXT_RECYCLE_WORKERS").ok()
+            .and_then(|v| v.parse::<usize>().ok()).unwrap_or(2).min(4);
+        let mut workers = Vec::new();
+        for i in 0..n {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Idle>(8);
+            if std::thread::Builder::new().name(format!("victory-recycle-{i}")).spawn(move || {
+                crate::cores::keep_helper_on_fast_cores("victory-recycle");
+                while let Ok(idle) = rx.recv() {
+                    idle.0.reset_allocator();
+                    put_idle(idle);
+                    recycle_stats(1);
+                }
+            }).is_ok() {
+                workers.push(tx);
+            }
+        }
+        tracing::info!(workers = workers.len(), "Relay Next R13a allocator recycle pool");
+        workers
+    })
+}
+
+#[cfg(windows)]
+fn recycle_stats(kind: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    let n = COUNTS[kind].fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(256) {
+        tracing::info!(queued = COUNTS[0].load(Ordering::Relaxed),
+            completed = COUNTS[1].load(Ordering::Relaxed),
+            inline_fallback = COUNTS[2].load(Ordering::Relaxed),
+            pool_misses = COUNTS[3].load(Ordering::Relaxed),
+            "Relay Next R13a allocator recycle statistics");
+    }
+}
+
+#[cfg(windows)]
+fn put_idle(idle: Idle) {
+    let mut pool = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    if pool.0.len() < IDLE_MOST.0 && pool.1 + idle.1 <= IDLE_MOST.1 {
+        pool.1 += idle.1;
+        pool.0.push(idle);
+    }
+    // If rejected, release its GPU objects outside the pool mutex.
+    drop(pool);
+}
+
+#[cfg(windows)]
+fn recycle_allocator(mut idle: Idle) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::TrySendError;
+    let workers = recycle_workers();
+    static TURN: AtomicUsize = AtomicUsize::new(0);
+    if !workers.is_empty() {
+        let start = TURN.fetch_add(1, Ordering::Relaxed) % workers.len();
+        for i in 0..workers.len() {
+            match workers[(start + i) % workers.len()].try_send(idle) {
+                Ok(()) => { recycle_stats(0); return; }
+                Err(TrySendError::Full(back) | TrySendError::Disconnected(back)) => idle = back,
+            }
+        }
+    }
+    recycle_stats(2);
+    idle.0.reset_allocator();
+    put_idle(idle);
+}
+
 /// A host list open for recording: one that has run, as a title's list is
 /// after its reset, or a new one.
 #[cfg(windows)]
@@ -256,7 +329,10 @@ fn fresh_list() -> Option<crate::host::HostList> {
     };
     match idle {
         Some(Idle(list, _)) => Some(list),
-        None => crate::host::host().and_then(|h| h.new_list().ok()),
+        None => {
+            if crate::relay_next::enabled() { recycle_stats(3); }
+            crate::host::host().and_then(|h| h.new_list().ok())
+        },
     }
 }
 
@@ -278,12 +354,14 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         }
         // As the title's reset does: what the list kept for its commands
         // goes, its allocators stay.
-        host.reset();
-        let bytes = host.scratch_kept();
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
-            idle.1 += bytes;
+        if crate::relay_next::enabled() && !recycle_workers().is_empty() {
+            host.clear_for_reset();
+            let bytes = host.scratch_kept();
+            recycle_allocator(Idle(host, bytes));
+        } else {
+            host.reset();
+            let bytes = host.scratch_kept();
+            put_idle(Idle(host, bytes));
         }
     }
 }
