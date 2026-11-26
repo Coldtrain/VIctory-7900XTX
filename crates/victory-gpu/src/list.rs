@@ -660,6 +660,10 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         return E_INVALIDARG;
     }
     let _called = crate::timeline::span("the title's list Reset");
+    #[cfg(windows)]
+    if let Some(host) = host_list(this) {
+        host.assert_next_idle();
+    }
     // A wait recorded and never submitted goes with the recording.
     VALUE_WAITS
         .lock()
