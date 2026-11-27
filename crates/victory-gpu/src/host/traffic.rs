@@ -24,15 +24,22 @@ static MOVED: Mutex<Option<HashMap<(u64, u64), Moved>>> = Mutex::new(None);
 pub(super) fn moved(way: usize, span: (u64, u64), ranges: impl Iterator<Item = (usize, usize)>) {
     let mut all = MOVED.lock().unwrap_or_else(|e| e.into_inner());
     let m = all.get_or_insert_with(Default::default).entry(span).or_default();
-    // (Thousands of runs lie in one piece, one after the other.)
-    let mut last = u32::MAX;
+    // Thousands of short runs often touch the same 64 KiB piece.
+    // Track the whole prior interval so overlaps don't lose an earlier piece.
+    let mut previous: Option<(u32, u32)> = None;
     for (from, to) in ranges.filter(|r| r.0 < r.1) {
         m.bytes[way] += (to - from) as u64;
         let (first, end) = ((from >> 16) as u32, ((to - 1) >> 16) as u32);
-        if (first, end) != (last, last) {
-            m.pieces[way].extend(first..=end);
+        match previous {
+            Some((old_first, old_end)) if first >= old_first && end <= old_end => {}
+            Some((old_first, old_end)) if first >= old_first && first <= old_end => {
+                if old_end < end {
+                    m.pieces[way].extend(old_end + 1..=end);
+                }
+            }
+            _ => m.pieces[way].extend(first..=end),
         }
-        last = end;
+        previous = Some((first, end));
     }
 }
 
@@ -69,5 +76,22 @@ pub(super) fn line(frames: f64) {
             mb(m.bytes[1]),
             m.pieces[1].len()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlapping_and_disjoint_runs_report_every_touched_piece() {
+        let span = (0x1000u64, 0x70000u64);
+        // A later run may retreat across a piece boundary. Both byte totals
+        // and the union of 64 KiB pieces must remain unchanged.
+        moved(UP, span, [(0, 0x20010), (0x10000, 0x10004), (0x30000, 0x40001), (0x2ffff, 0x30002)].into_iter());
+        let all = MOVED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap();
+        let got = all.get(&span).unwrap();
+        assert_eq!(got.bytes[UP], 0x20010 + 4 + 0x10001 + 3);
+        assert_eq!(got.pieces[UP], HashSet::from([0, 1, 2, 3, 4]));
     }
 }
