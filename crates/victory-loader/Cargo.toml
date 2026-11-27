@@ -16,6 +16,7 @@ tracing.workspace = true
 blake3.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder"] }
 windows-sys = { workspace = true, features = [
     "Wdk_System_Threading",
     "Win32_Foundation",

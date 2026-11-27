@@ -2,6 +2,7 @@ param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Parallel,
     [switch]$RNext,
+    [switch]$Relay2,
     [switch]$CoolFoxResidency,
     [switch]$CoolFoxThin,
     [ValidateSet('quality','balanced','performance','ultra-performance','720p')][string]$Fsr4K,
@@ -103,6 +104,23 @@ if ($CoolFoxThin) {
     # Unlike -Parallel, do not enable inline readback or change upload workers.
     $settings.VICTORY_LOG = 'warn,victory_gpu::host=info,victory_gpu::relay_next=info,victory_gpu::list::thin=info,victory_gpu::queue::behind=info'
 }
+if ($Relay2) {
+    if ($RNext) { throw 'Choose -Relay2 or -RNext, not both.' }
+    $settings.VICTORY_RELAY = '2'
+    $settings.VICTORY_LATE_WAIT = '3'
+    $settings.VICTORY_RELAY_NEXT = '0'
+    $settings.VICTORY_RELAY_COPY = '0'
+    $settings.VICTORY_KEEP_SNAPSHOTS = '0'
+    $settings.VICTORY_LATE_WAIT_LISTS = '32'
+    $settings.VICTORY_PORT_TEXTURE_PRELUDE = '0'
+    # First isolate the legacy landing thread. -Parallel explicitly opts
+    # into thin recording; without it do not add async submission.
+    if (-not $Parallel -and -not $CoolFoxThin) {
+        $settings.VICTORY_ASYNC_SUBMIT = '0'
+        $settings.VICTORY_THIN = '0'
+        $settings.VICTORY_INLINE_READBACK = '0'
+    }
+}
 $settings.VICTORY_LOG = 'warn,victory_gpu=info,victory_loader=info'
 if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }
 foreach ($name in $More.Keys) { $settings[$name] = $More[$name] }
@@ -110,6 +128,8 @@ $console = 'series-s'
 if ($settings.VICTORY_FSR_4K -and $settings.VICTORY_FSR_4K -ne '0') {
     # Do not compound the separate experimental FSR path with new timing.
     if (-not $More.ContainsKey('VICTORY_FRAME_INTERVAL_MS')) { $settings.VICTORY_FRAME_INTERVAL_MS = '' }
+    if ($Relay2) { throw 'Test Relay 2 without FSR first.' }
+    if ($settings.VICTORY_SIM_MAX_MS -and $settings.VICTORY_SIM_MAX_MS -ne '0') { throw 'Test simulation-step override without FSR first.' }
     $console = 'series-x'
     $settings.VICTORY_OWN_UPSCALER = '0'
     $settings.VICTORY_RENDER_SCALE = '0'

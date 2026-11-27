@@ -1,0 +1,9 @@
+# Sprint 14b: legacy Relay 2 landing ordering + bounded simulation step experiment
+
+The legacy relay landing now delays each flight's shadow copy_back_done until after the line's completion state and notifications have been published, following VItoriaBr commits 91cd9c9e25b41fc88d8e2793c1ee0a0a293b21e3 and aa85bb0ffb6650043ac1a6089e6ca80de5a3a727. Keep individual flight declarations, not merged declarations; the additional line-mutex notification after pending-range release also covers this fork's shadow-dependent WHY_STALE waits. This does not alter Relay 0 or Relay Next.
+
+Use -Relay2 to test legacy relay (late wait 3, relay-next 0, no retained snapshots, 32 lists, no separate copy queue, no texture prelude). Initial test without -Parallel isolates the landing fix; add -Parallel in a later run. The ordinary launcher retains Relay 0.
+
+Optional VICTORY_SIM_MAX_MS=125 (100..200 accepted) widens only the documented timer-update scalar minimum, if the runtime-function bounds and unique decoded direct RIP-relative scalar MINSS/VMINSS of the exact 1/15 s read-only constant match. The original hash is checked in run.rs. A private read-only literal is used rather than modifying the global constant. Unrecognized or ambiguous timer code is left unmodified; check the log for "simulation max step patched" or "simulation max step unchanged". This is an experimental candidate, not a confirmed patch on the retail image. It does not implement fixed substepping; large deltas may destabilize physics. Start at 125 ms; disable with 0. The previous 60 FPS/minimum-step patches and timer diagnostics remain enabled.
+
+Test separately and together using -More @{VICTORY_RENDER_SCALE='0.30'; VICTORY_SIM_MAX_MS='125'} and -Relay2 -CoolFoxResidency. Compare gameplay timer advancement with wall time before concluding that the slow motion is resolved. Windows compilation, actual title match, and runtime stability are not yet verified.

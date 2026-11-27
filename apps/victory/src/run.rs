@@ -228,6 +228,12 @@ pub fn run(
             eprintln!("frame rate: our clock {ms} ms; title rate unchanged (diagnostic only)");
         }
     }
+    if execute && std::env::var("VICTORY_SIM_MAX_MS").is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0") {
+        anyhow::ensure!(hash.as_str() == "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93",
+            "Simulation-step override requires the verified retail build");
+        // SAFETY: the mapped image is still idle; no title threads have run.
+        unsafe { victory_loader::frame_rate::apply_max_step(image.base(), image.info().size_of_image as usize)?; }
+    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());

@@ -334,3 +334,8 @@ mod tests {
         }
     }
 }
+
+#[cfg(windows)]
+mod max_step;
+#[cfg(windows)]
+pub use max_step::apply_max_step;
