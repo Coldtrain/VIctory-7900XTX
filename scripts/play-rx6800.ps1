@@ -124,6 +124,15 @@ if ($Relay2) {
 $settings.VICTORY_LOG = 'warn,victory_gpu=info,victory_loader=info'
 if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }
 foreach ($name in $More.Keys) { $settings[$name] = $More[$name] }
+# Reference Relay 2 does not combine legacy landing with the Relay-0 upload path.
+if ($settings.VICTORY_RELAY -eq '2' -and $settings.VICTORY_RELAY_REFERENCE -eq '1') {
+    $settings.VICTORY_PORT_TEXTURE_PRELUDE = '0'
+    $settings.VICTORY_CARD_STEPS = '0'
+    $settings.VICTORY_RELAY_COPY = '0'
+    $settings.VICTORY_ASYNC_SUBMIT = '0'
+    $settings.VICTORY_INLINE_READBACK = '0'
+    # Keep descriptor publication, journal and record-store patches enabled.
+}
 $console = 'series-s'
 if ($settings.VICTORY_FSR_4K -and $settings.VICTORY_FSR_4K -ne '0') {
     # Do not compound the separate experimental FSR path with new timing.
