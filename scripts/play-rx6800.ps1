@@ -124,6 +124,21 @@ if ($Relay2) {
 $settings.VICTORY_LOG = 'warn,victory_gpu=info,victory_loader=info'
 if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }
 foreach ($name in $More.Keys) { $settings[$name] = $More[$name] }
+# JoshuuDev legacy relay path: do not combine with Relay 0 upload prelude.
+if ($settings.VICTORY_RELAY -in @('1','2') -and $settings.VICTORY_RELAY_REFERENCE -ne '0') {
+    $settings.VICTORY_RELAY_REFERENCE = '1'
+    $settings.VICTORY_RELAY_NEXT = '0'
+    $settings.VICTORY_PORT_TEXTURE_PRELUDE = '0'
+    $settings.VICTORY_CARD_STEPS = '0'
+    $settings.VICTORY_RELAY_COPY = '0'
+    $settings.VICTORY_ASYNC_SUBMIT = '0'
+    $settings.VICTORY_INLINE_READBACK = '0'
+    $settings.VICTORY_KEEP_SNAPSHOTS = '0'
+    if (-not $More.ContainsKey('VICTORY_LATE_WAIT')) { $settings.VICTORY_LATE_WAIT = '2' }
+    if (-not $More.ContainsKey('VICTORY_LATE_WAIT_WRITES')) { $settings.VICTORY_LATE_WAIT_WRITES = '0' }
+    if (-not $More.ContainsKey('VICTORY_LATE_WAIT_LISTS')) { $settings.VICTORY_LATE_WAIT_LISTS = '128' }
+    # Descriptor publication and its journal deliberately remain untouched.
+}
 $console = 'series-s'
 if ($settings.VICTORY_FSR_4K -and $settings.VICTORY_FSR_4K -ne '0') {
     # Do not compound the separate experimental FSR path with new timing.
