@@ -238,7 +238,7 @@ struct ResidencyFence {
 unsafe impl Send for ResidencyFence {}
 
 fn explicit_residency(device: &ID3D12Device) -> Option<ID3D12Device3> {
-    if relay_exact() && std::env::var_os("VICTORY_EXPLICIT_RESIDENCY").is_none_or(|v| v != "0") {
+    if relay_exact() && !relay_reference() && std::env::var_os("VICTORY_EXPLICIT_RESIDENCY").is_none_or(|v| v != "0") {
         device.cast().ok()
     } else {
         None
@@ -3654,7 +3654,7 @@ fn log_blame(frames: f64) {
 
 /// Whether flights that write `written` stop a read of `len` bytes at `src`.
 fn read_blocked(written: &[(usize, usize)], src: usize, len: usize) -> bool {
-    touches(written, src, src + len) && !fill_is_titles(src, len)
+    touches(written, src, src + len) && (relay_reference() || !fill_is_titles(src, len))
 }
 
 /// Whether they stop a title buffer copy, and if so whether by its source.
@@ -4230,6 +4230,7 @@ fn late_threads() {
                 copy_queue_requested = relay_copy(),
                 reference_landing = relay_reference(),
                 late_stage = late_stage(),
+                reference_residency = relay_reference(),
                 flight_recorder = relay_trace_on(),
                 "what shaders wrote is copied back by a thread of its own, beside the submitting thread (VICTORY_RELAY=1)"
             );
