@@ -3071,7 +3071,14 @@ fn relay_exact() -> bool {
 /// may be in what is fetched, as before.
 fn relay_copy() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_COPY").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| !relay_reference() && std::env::var_os("VICTORY_RELAY_COPY").is_some_and(|v| v == "1"))
+}
+
+/// Opt-in compatibility with JoshuuDev/victory-amd's Relay 2 landing path.
+/// Keep the existing renderer, descriptor lifetime checks and removal diagnostics.
+fn relay_reference() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| relay_exact() && std::env::var_os("VICTORY_RELAY_REFERENCE").is_some_and(|v| v == "1"))
 }
 
 /// Told when something joins [`LINE`], for the thread that lands flights
@@ -4221,6 +4228,8 @@ fn late_threads() {
             tracing::info!(
                 exact = relay_exact(),
                 copy_queue_requested = relay_copy(),
+                reference_landing = relay_reference(),
+                late_stage = late_stage(),
                 flight_recorder = relay_trace_on(),
                 "what shaders wrote is copied back by a thread of its own, beside the submitting thread (VICTORY_RELAY=1)"
             );
@@ -4518,10 +4527,11 @@ fn late_line(frames: f64) {
     if relay() {
         let r: Vec<f64> = RELAY_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
-            "the relay per frame (VICTORY_RELAY=1): {:.1} flights landed in {:.1} landings by the thread that copies back, \
+            "the relay per frame (VICTORY_RELAY={}): {:.1} flights landed in {:.1} landings by the thread that copies back, \
              beside the submitting thread; that thread waited {:.1} ms for the card with nothing to land and {:.1} ms for \
              fetches of card copies' pieces, and was {:.1} ms landing in all (the frame line's \"copying back\" is its time; \
              \"settles\" above are waits of other threads for it)",
+            if relay_exact() { 2 } else { 1 },
             r[1],
             r[0],
             r[2] / 1000.0,
@@ -6168,16 +6178,29 @@ impl Host {
                     }
                 }
                 relay_trace(|| format!("landing merge begin plans={} cpu_copies={}", plans.len(), back.len()));
-                let mut hand_back = relay_hand_back(&back);
+                // Reference ordering: finish the GPU fetch before preparing the CPU scan.
+                let mut hand_back = if relay_reference() { None } else { Some(relay_hand_back(&back)) };
                 stage.next("landing: copies in the card's memory");
                 self.relay_card_back(&plans, fetch, &mut || {
-                    if crate::land::on() {
+                    if crate::land::on() && !relay_reference() {
                         let _looking = crate::timeline::span("landing: looking through copies, beside the fetch");
-                        hand_back.look(crate::land::stat::SCAN_BESIDE);
+                        if let Some(back) = hand_back.as_mut() {
+                            back.look(crate::land::stat::SCAN_BESIDE);
+                        }
                     }
                 });
                 stage.next("landing: copies in the PC's memory");
-                hand_back.merge();
+                hand_back.unwrap_or_else(|| relay_hand_back(&back)).merge();
+                if relay_reference() {
+                    // Match the reference: release each flight's write declarations after
+                    // both merges, before exposing its readbacks and completion signals.
+                    // Keep line.written until the normal publication below.
+                    for flight in &flights {
+                        for (shadow, ranges) in &flight.back {
+                            shadow.copy_back_done(ranges);
+                        }
+                    }
+                }
                 relay_trace(|| format!("landing merge end elapsed_us={}", landing.elapsed().as_micros()));
                 // Keep every flight's pending ranges until the line publishes
                 // its landing. Merging ranges above is only for the copy work.
@@ -6206,7 +6229,9 @@ impl Host {
                         own.landed();
                     }
                     landed.push((flight.lists, flight.order));
-                    backs.extend(flight.back);
+                    if !relay_reference() {
+                        backs.extend(flight.back);
+                    }
                     crate::land::spent(crate::land::stat::READ_BACKS, telling)
                 }
                 Late::Write(at, what, bytes) => {
